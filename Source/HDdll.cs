@@ -66,7 +66,7 @@ namespace ghoh
         public const HDenum HD_CURRENT_TRANSFORM = 0x2052;
         public const HDenum HD_CURRENT_ANGULAR_VELOCITY = 0x2053;
         public const HDenum HD_CURRENT_JACOBIAN = 0x2054;
-        public const HDenum HD_CURRENT_FORCE = 0x2057; // Added HD_CURRENT_FORCE, verify the value
+        public const HDenum HD_CURRENT_FORCE = 0x2700; 
 
         [StructLayout(LayoutKind.Sequential)]
         public struct HDErrorInfo
