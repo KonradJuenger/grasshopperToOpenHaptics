@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+﻿using System;
+using System.Runtime.InteropServices;
 
 namespace ghoh
 {
@@ -14,7 +15,6 @@ namespace ghoh
     using HDerror = System.UInt32;  // unsigned int
     using HDenum = System.UInt32;   // unsigned int
     using HHD = System.UInt32;      // unsigned int
-    using HDCallbackCode = System.UInt32;
 
     public static unsafe class HDdll
     {
@@ -48,8 +48,9 @@ namespace ghoh
         public const HDushort HD_MAX_SCHEDULER_PRIORITY = HDushort.MaxValue;
         public const HDushort HD_DEFAULT_SCHEDULER_PRIORITY = (HD_MAX_SCHEDULER_PRIORITY + HD_MIN_SCHEDULER_PRIORITY) / 2;
 
-        public const HDCallbackCode HD_CALLBACK_DONE = 0;
-        public const HDCallbackCode HD_CALLBACK_CONTINUE = 1;
+        // Callback codes
+        public const uint HD_CALLBACK_DONE = 0;
+        public const uint HD_CALLBACK_CONTINUE = 1;
 
         // Get parameter options:
         public const HDenum HD_CURRENT_BUTTONS = 0x2000;
@@ -65,53 +66,70 @@ namespace ghoh
         public const HDenum HD_CURRENT_TRANSFORM = 0x2052;
         public const HDenum HD_CURRENT_ANGULAR_VELOCITY = 0x2053;
         public const HDenum HD_CURRENT_JACOBIAN = 0x2054;
+        public const HDenum HD_CURRENT_FORCE = 0x2057; // Added HD_CURRENT_FORCE, verify the value
 
         [StructLayout(LayoutKind.Sequential)]
-        public struct ErrorInfo
+        public struct HDErrorInfo
         {
             public HDerror ErrorCode;
             public int InternalErrorCode;
-            public HHD Handle;
+            public HHD hHD;
         }
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public unsafe delegate uint HDSchedulerCallback(void* pData);
+
+        // DLL Imports with corrected CallingConvention and marshalling
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         public static extern HHD hdInitDevice([MarshalAs(UnmanagedType.LPStr)] string pConfigName);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdDisableDevice(HHD hHD);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern HHD hdGetCurrentDevice();
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
-        public static extern ErrorInfo hdGetError();
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern HDErrorInfo hdGetError();
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-        [return: MarshalAs(UnmanagedType.LPStr)]
-        public static extern string hdGetErrorString(HDerror errorCode);
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern IntPtr hdGetErrorString(HDerror errorCode);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdStartScheduler();
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdStopScheduler();
 
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate HDCallbackCode HDSchedulerCallback(void *pData);
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr hdScheduleAsynchronous(HDSchedulerCallback pCallback,
+                                                           void* pUserData,
+                                                           HDushort nPriority);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdScheduleSynchronous(HDSchedulerCallback pCallback,
-                                                        void *pUserData,
+                                                        void* pUserData,
                                                         HDushort nPriority);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void hdUnschedule(IntPtr hHandle);
+
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdBeginFrame(HHD hHD);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void hdEndFrame(HHD hHD);
 
-        [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
-        public static extern void hdGetDoublev(HDenum Field, HDdouble* ValueOut);
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void hdGetDoublev(HDenum pname, HDdouble* paramsOut);
+
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void hdSetDoublev(HDenum pname, double* values);
+
+        public const HDulong HD_WAIT_INFINITE = 0xFFFFFFFFFFFFFFFF;
+
+        [DllImport("hd.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern HDboolean hdWaitForCompletion(IntPtr hHandle, HDulong waitCode);
 
     }
 }
