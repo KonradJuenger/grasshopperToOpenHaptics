@@ -6,7 +6,7 @@ namespace ghoh
 {
     public class ghogRead : GH_Component
     {
-        public ghogRead() : base("ghogRead", "read", "Description", "ghoh", "device")
+        public ghogRead() : base("ghogRead", "read", "Reads data from the haptic device", "ghoh", "device")
         {
         }
 
@@ -24,67 +24,63 @@ namespace ghoh
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            uint handle = DeviceManager.DeviceHandle;
-            if (handle == HDdll.HD_BAD_HANDLE)
+            int handle = DeviceManager.DeviceHandle;
+            if (handle == HDdll.HD_INVALID_HANDLE)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized.");
+                Logger.Log("Device not initialized in ghogRead component.");
                 return;
             }
 
-            unsafe
+            double[] transform = new double[16];
+            DevicePositionCallback(transform);
+
+            var origin = new Point3d(-transform[12], transform[14] + 88.11, transform[13] + 65.51);
+            var yDirection = new Vector3d(-transform[0], transform[2], transform[1]);
+            var xDirection = new Vector3d(-transform[4], transform[6], transform[5]);
+            var plane = new Plane(origin, xDirection, yDirection);
+
+            DA.SetData(0, plane);
+
+            double[] buttonStatus = new double[1];
+            DeviceButtonCallback(buttonStatus);
+
+            bool button1Status = (((int)buttonStatus[0]) & 0x01) != 0;
+            bool button2Status = (((int)buttonStatus[0]) & 0x02) != 0;
+            DA.SetData(1, button1Status);
+            DA.SetData(2, button2Status);
+
+            Logger.Log($"ghogRead component output Plane: Origin ({origin}), XDir ({xDirection}), YDir ({yDirection}), Button1: {button1Status}, Button2: {button2Status}");
+        }
+
+        static void DevicePositionCallback(double[] transform)
+        {
+            int deviceHandle = DeviceManager.DeviceHandle;
+            if (deviceHandle == HDdll.HD_INVALID_HANDLE)
+                return;
+
+            HDdll.hdScheduleSynchronous((_) =>
             {
-                fixed (double* transform = new double[16])
-                {
-                    HDdll.hdScheduleSynchronous(DevicePositionCallback, (void*)transform,
-                        HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-
-                    var origin = new Point3d(-transform[12], transform[14] + 88.11, transform[13] + 65.51);
-                    var yDirection = new Vector3d(-transform[0], transform[2], transform[1]);
-                    var xDirection = new Vector3d(-transform[4], transform[6], transform[5]);
-                    var plane = new Plane(origin, xDirection, yDirection);
-
-                    DA.SetData(0, plane);
-                }
-
-                fixed (double* buttonStatus = new double[1])
-                {
-                    HDdll.hdScheduleSynchronous(DeviceButtonCallback, (void*)buttonStatus,
-                        HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-
-                    bool button1Status = (((int)*buttonStatus) & 0x01) != 0;
-                    bool button2Status = (((int)*buttonStatus) & 0x02) != 0;
-                    DA.SetData(1, button1Status);
-                    DA.SetData(2, button2Status);
-                }
-            }
+                HDdll.hdBeginFrame(deviceHandle);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
+                HDdll.hdEndFrame(deviceHandle);
+                return HDdll.HD_CALLBACK_DONE;
+            }, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
         }
 
-        unsafe static uint DevicePositionCallback(void* pData)
+        static void DeviceButtonCallback(double[] buttonStatus)
         {
-            uint deviceHandle = DeviceManager.DeviceHandle;
-            if (deviceHandle == HDdll.HD_BAD_HANDLE)
+            int deviceHandle = DeviceManager.DeviceHandle;
+            if (deviceHandle == HDdll.HD_INVALID_HANDLE)
+                return;
+
+            HDdll.hdScheduleSynchronous((_) =>
+            {
+                HDdll.hdBeginFrame(deviceHandle);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttonStatus);
+                HDdll.hdEndFrame(deviceHandle);
                 return HDdll.HD_CALLBACK_DONE;
-
-            double* pTransform = (double*)pData;
-            HDdll.hdBeginFrame(deviceHandle);
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, pTransform);
-            HDdll.hdEndFrame(deviceHandle);
-
-            return HDdll.HD_CALLBACK_DONE;
-        }
-
-        unsafe static uint DeviceButtonCallback(void* pData)
-        {
-            uint deviceHandle = DeviceManager.DeviceHandle;
-            if (deviceHandle == HDdll.HD_BAD_HANDLE)
-                return HDdll.HD_CALLBACK_DONE;
-
-            double* pButtonStatus = (double*)pData;
-            HDdll.hdBeginFrame(deviceHandle);
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, pButtonStatus);
-            HDdll.hdEndFrame(deviceHandle);
-
-            return HDdll.HD_CALLBACK_DONE;
+            }, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
         }
 
         protected override System.Drawing.Bitmap Icon => null;

@@ -1,148 +1,60 @@
 ﻿using Grasshopper.Kernel;
 using Rhino.Geometry;
 using System;
-using System.Runtime.InteropServices;
 
 namespace ghoh
 {
     public class ghohSetForce : GH_Component
     {
-        public ghohSetForce() : base("ghohSetForce", "setForce", "Apply force to the haptic device", "ghoh", "device")
+        public ghohSetForce() : base("ghohSetForce", "SetForce", "Sets force to the haptic device", "ghoh", "device")
         {
         }
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
-            pManager.AddVectorParameter("Force", "F", "Force vector to apply (in Newtons)", GH_ParamAccess.item);
-            pManager.AddBooleanParameter("Enable", "E", "Enable or disable force output", GH_ParamAccess.item, false);
+            pManager.AddBooleanParameter("Enable", "E", "Enable or disable force application", GH_ParamAccess.item, false);
+            pManager.AddVectorParameter("Force", "F", "Force vector to apply to the device", GH_ParamAccess.item, new Vector3d(0, 0, 0));
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
+            // No output parameters needed
         }
-
-        private bool forceEnabled = false;
-        private Vector3d currentForce = Vector3d.Zero;
-        private IntPtr forceCallbackHandle = IntPtr.Zero;
-        private GCHandle gcHandle;
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            Vector3d force = Vector3d.Zero;
+            Logger.Log("ghohSetForce - SolveInstance started");
+
             bool enable = false;
+            Vector3d force = new Vector3d();
 
-            if (!DA.GetData(0, ref force))
-            {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Failed to get force input.");
-                return;
-            }
+            if (!DA.GetData(0, ref enable)) return;
+            if (!DA.GetData(1, ref force)) return;
 
-            if (!DA.GetData(1, ref enable))
-            {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Failed to get enable input.");
-                return;
-            }
+            Logger.Log($"ghohSetForce - Retrieved force: {force.X},{force.Y},{force.Z}");
+            Logger.Log($"ghohSetForce - Retrieved enable: {enable}");
 
-            uint handle = DeviceManager.DeviceHandle;
-            if (handle == HDdll.HD_BAD_HANDLE)
+            int handle = DeviceManager.DeviceHandle;
+            Logger.Log($"ghohSetForce - Device handle: {handle}");
+
+            if (handle == HDdll.HD_INVALID_HANDLE)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized.");
+                Logger.Log("ghohSetForce - Device not initialized.");
                 return;
             }
 
-            forceEnabled = enable;
-            currentForce = force;
+            // Convert Rhino Vector3d to double array
+            double[] forceArray = new double[3] { force.X, force.Y, force.Z };
 
-            if (forceEnabled)
-            {
-                if (forceCallbackHandle == IntPtr.Zero)
-                {
-                    if (!gcHandle.IsAllocated)
-                        gcHandle = GCHandle.Alloc(this);
+            Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
 
-                    unsafe
-                    {
-                        forceCallbackHandle = HDdll.hdScheduleAsynchronous(ForceOutputCallback,
-                            (void*)GCHandle.ToIntPtr(gcHandle), HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                    }
-                }
-            }
-            else
-            {
-                if (forceCallbackHandle != IntPtr.Zero)
-                {
-                    HDdll.hdUnschedule(forceCallbackHandle);
-                    HDdll.hdWaitForCompletion(forceCallbackHandle, HDdll.HD_WAIT_INFINITE);
-                    forceCallbackHandle = IntPtr.Zero;
-
-                    if (gcHandle.IsAllocated)
-                        gcHandle.Free();
-                }
-            }
-        }
-
-        private unsafe static uint ForceOutputCallback(void* pData)
-        {
-            try
-            {
-                uint deviceHandle = DeviceManager.DeviceHandle;
-                if (deviceHandle == HDdll.HD_BAD_HANDLE)
-                    return HDdll.HD_CALLBACK_DONE;
-
-                GCHandle handle = GCHandle.FromIntPtr((IntPtr)pData);
-                if (!handle.IsAllocated)
-                {
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                ghohSetForce instance = handle.Target as ghohSetForce;
-
-                if (instance == null || !instance.forceEnabled)
-                {
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                HDdll.hdBeginFrame(deviceHandle);
-
-                double[] forceArray = new double[3] { instance.currentForce.X, instance.currentForce.Y, instance.currentForce.Z };
-                fixed (double* forcePtr = forceArray)
-                {
-                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, forcePtr);
-                }
-
-                HDdll.hdEndFrame(deviceHandle);
-
-                return HDdll.HD_CALLBACK_CONTINUE;
-            }
-            catch (Exception ex)
-            {
-                // Log the exception or handle it appropriately
-                // For now, we simply stop the callback to prevent crashing
-                return HDdll.HD_CALLBACK_DONE;
-            }
-        }
-
-        public override void RemovedFromDocument(GH_Document document)
-        {
-            base.RemovedFromDocument(document);
-            Cleanup();
-        }
-
-        private void Cleanup()
-        {
-            if (forceCallbackHandle != IntPtr.Zero)
-            {
-                HDdll.hdUnschedule(forceCallbackHandle);
-                HDdll.hdWaitForCompletion(forceCallbackHandle, HDdll.HD_WAIT_INFINITE);
-                forceCallbackHandle = IntPtr.Zero;
-            }
-
-            if (gcHandle.IsAllocated)
-                gcHandle.Free();
+            // Apply the force to the device
+            DeviceManager.ApplyForce(forceArray, enable);
         }
 
         protected override System.Drawing.Bitmap Icon => null;
 
-        public override Guid ComponentGuid => new Guid("DCA0A7F0-0C6B-4E84-8E2D-5C9A0FA2B6D1");
+        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c69c");
     }
 }
