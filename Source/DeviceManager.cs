@@ -82,29 +82,21 @@ namespace ghoh
 
                 forceEnabled = enable;
 
+
+
                 if (forceEnabled)
                 {
-                    Array.Copy(force, currentForce, 3);
-
-                    if (forceCallbackHandle == IntPtr.Zero)
-                    {
-                        // Schedule force callback
-                        Logger.Log("Scheduling force callback.");
-                        forceCallbackHandle = HDdll.hdScheduleAsynchronous(ForceCallback, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                    }
+                    HDdll.hdBeginFrame(deviceHandle);
+                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+                    HDdll.hdEndFrame(deviceHandle);
                 }
                 else
                 {
-                    if (forceCallbackHandle != IntPtr.Zero)
-                    {
-                        // Unschedule force callback
-                        Logger.Log("Unscheduling force callback.");
-                        HDdll.hdUnschedule(forceCallbackHandle);
-                        // Wait for the callback to complete
-                        HDdll.hdWaitForCompletion(forceCallbackHandle, HDdll.HD_WAIT_INFINITE);
-                        forceCallbackHandle = IntPtr.Zero;
-                    }
+                    HDdll.hdBeginFrame(deviceHandle);
+                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
+                    HDdll.hdEndFrame(deviceHandle);
                 }
+
             }
         }
 
