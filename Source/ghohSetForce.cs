@@ -21,37 +21,37 @@ namespace ghoh
             // No output parameters needed
         }
 
-        protected override void SolveInstance(IGH_DataAccess DA)
-        {
-            Logger.Log("ghohSetForce - SolveInstance started");
+protected override void SolveInstance(IGH_DataAccess DA)
+{
+    Logger.Log("ghohSetForce - SolveInstance started");
 
-            bool enable = false;
-            Vector3d force = new Vector3d();
+    bool enable = false;
+    Vector3d force = new Vector3d();
 
-            if (!DA.GetData(0, ref enable)) return;
-            if (!DA.GetData(1, ref force)) return;
+    if (!DA.GetData(0, ref enable)) return;
+    if (!DA.GetData(1, ref force)) return;
 
-            Logger.Log($"ghohSetForce - Retrieved force: {force.X},{force.Y},{force.Z}");
-            Logger.Log($"ghohSetForce - Retrieved enable: {enable}");
+    Logger.Log($"ghohSetForce - Retrieved force: {force.X},{force.Y},{force.Z}");
+    Logger.Log($"ghohSetForce - Retrieved enable: {enable}");
 
-            int handle = DeviceManager.DeviceHandle;
-            Logger.Log($"ghohSetForce - Device handle: {handle}");
+    int handle = DeviceManager.DeviceHandle;
+    Logger.Log($"ghohSetForce - Device handle: {handle}");
 
-            if (handle == HDdll.HD_INVALID_HANDLE)
-            {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized.");
-                Logger.Log("ghohSetForce - Device not initialized.");
-                return;
-            }
+    if (handle == HDdll.HD_INVALID_HANDLE)
+    {
+        AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized.");
+        Logger.Log("ghohSetForce - Device not initialized.");
+        return;
+    }
 
-            // Convert Rhino Vector3d to double array
-            double[] forceArray = new double[3] { force.X, force.Y, force.Z };
+    // Convert Rhino Vector3d to double array
+    double[] forceArray = new double[3] { force.X, force.Y, force.Z };
 
-            Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
+    Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
 
-            // Apply the force to the device
-            DeviceManager.ApplyForce(forceArray, enable);
-        }
+    // Apply the force to the device
+    DeviceManager.ApplyForce(forceArray, enable);
+}
 
         protected override System.Drawing.Bitmap Icon => null;
 
