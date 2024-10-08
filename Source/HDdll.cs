@@ -163,5 +163,7 @@ namespace ghoh
         // Makes a device the current device for subsequent calls
         [DllImport("hd.dll", CallingConvention = CallingConvention.StdCall)]
         public static extern void hdMakeCurrentDevice(HHD hHD);
+
+
     }
 }

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace ghoh
 {
@@ -10,12 +11,19 @@ namespace ghoh
         private static IntPtr forceCallbackHandle = IntPtr.Zero;
         private static double[] currentForce = new double[3];
         private static bool forceEnabled = false;
+        private static bool isRunning = false;
 
         private static bool loggingEnabled = true;
 
-        // Keep references to delegates to prevent garbage collection
+        // Keep a reference to the delegate to prevent garbage collection
         private static HDdll.HDSchedulerCallback forceCallbackDelegate = ForceCallback;
-        private static HDdll.HDSchedulerCallback setZeroForceCallbackDelegate = SetZeroForceCallback;
+
+        public struct DeviceState
+        {
+            public double[] Position;
+            public double[] Transform;
+            public int Buttons;
+        }
 
         static DeviceManager()
         {
@@ -58,7 +66,7 @@ namespace ghoh
                     IntPtr errPtr = HDdll.hdGetErrorString(err.ErrorCode);
                     errorMessage = Marshal.PtrToStringAnsi(errPtr);
                     Logger.Log($"Initialization error: {errorMessage}");
-                    Logger.Log($"HD Error Code: {err.ErrorCode}, Internal Error Code: {err.InternalErrorCode}");
+                    Logger.Log($"HD Error Code: {err.ErrorCode}, Internal Error: {err.InternalErrorCode}");
                     deviceHandle = HDdll.HD_INVALID_HANDLE;
                     return false;
                 }
@@ -73,6 +81,11 @@ namespace ghoh
                 HDdll.hdStartScheduler();
                 Logger.Log("Scheduler started.");
 
+                // Start the force update loop
+                isRunning = true;
+                Thread forceThread = new Thread(ForceUpdateLoop);
+                forceThread.Start();
+
                 errorMessage = null;
                 return true;
             }
@@ -80,48 +93,115 @@ namespace ghoh
 
         public static void ApplyForce(double[] force, bool enable)
         {
-            IntPtr callbackHandleToUnschedule = IntPtr.Zero;
-
             lock (lockObj)
             {
-                Logger.Log($"Applying force: [{force[0]}, {force[1]}, {force[2]}], Enable: {enable}");
+                Logger.Log($"ApplyForce called with force: [{force[0]}, {force[1]}, {force[2]}], Enable: {enable}");
 
+                forceEnabled = enable;
                 if (enable)
                 {
-                    forceEnabled = true;
                     Array.Copy(force, currentForce, 3);
-
-                    if (forceCallbackHandle == IntPtr.Zero)
-                    {
-                        // Schedule the asynchronous force callback
-                        forceCallbackHandle = HDdll.hdScheduleAsynchronous(forceCallbackDelegate, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                        Logger.Log("Force callback scheduled.");
-                    }
                 }
                 else
                 {
-                    forceEnabled = false;
-
-                    // Schedule a synchronous callback to set force to zero
-                    HDdll.hdScheduleSynchronous(setZeroForceCallbackDelegate, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                    Logger.Log("SetZeroForceCallback scheduled.");
-
-                    if (forceCallbackHandle != IntPtr.Zero)
-                    {
-                        callbackHandleToUnschedule = forceCallbackHandle;
-                        forceCallbackHandle = IntPtr.Zero;
-                        Logger.Log("Force callback handle reset.");
-                    }
+                    Array.Clear(currentForce, 0, currentForce.Length);
                 }
             }
+        }
 
-            // Unschedule the asynchronous force callback outside the lock
-            if (callbackHandleToUnschedule != IntPtr.Zero)
+        private static void ForceUpdateLoop()
+        {
+            while (isRunning)
             {
-                Logger.Log("Unscheduling force callback.");
-                HDdll.hdUnschedule(callbackHandleToUnschedule);
-                Logger.Log("Force callback unscheduled.");
+                try
+                {
+                    HDdll.hdScheduleSynchronous(ForceCallback, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
+                    Thread.Sleep(1); // Small delay to prevent excessive CPU usage
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogException(ex);
+                }
             }
+        }
+
+        private static uint ForceCallback(IntPtr userData)
+        {
+            try
+            {
+                Logger.Log("ForceCallback entered");
+
+                if (deviceHandle == HDdll.HD_INVALID_HANDLE)
+                {
+                    Logger.Log("ForceCallback: Invalid device handle, stopping callback.");
+                    return HDdll.HD_CALLBACK_DONE;
+                }
+
+                HDdll.hdBeginFrame(deviceHandle);
+
+                if (forceEnabled)
+                {
+                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, currentForce);
+                    Logger.Log($"ForceCallback: Force applied: [{currentForce[0]}, {currentForce[1]}, {currentForce[2]}]");
+                }
+                else
+                {
+                    double[] zeroForce = new double[3] { 0, 0, 0 };
+                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, zeroForce);
+                    Logger.Log("ForceCallback: Zero force applied.");
+                }
+
+                HDdll.hdEndFrame(deviceHandle);
+
+                // Check for errors
+                HDdll.HDErrorInfo error = HDdll.hdGetError();
+                if (error.ErrorCode != HDdll.HD_SUCCESS)
+                {
+                    Logger.Log($"ForceCallback: HD Error: {error.ErrorCode}, Internal Error: {error.InternalErrorCode}");
+                    return HDdll.HD_CALLBACK_DONE;
+                }
+
+                Logger.Log("ForceCallback completed successfully");
+                return HDdll.HD_CALLBACK_DONE;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogException(ex);
+                return HDdll.HD_CALLBACK_DONE;
+            }
+        }
+
+        public static DeviceState GetDeviceState()
+        {
+            var state = new DeviceState
+            {
+                Position = new double[3],
+                Transform = new double[16],
+                Buttons = 0
+            };
+
+            if (deviceHandle == HDdll.HD_INVALID_HANDLE)
+            {
+                Logger.Log("GetDeviceState called with invalid device handle.");
+                return state;
+            }
+
+            HDdll.hdScheduleSynchronous((_) =>
+            {
+                HDdll.hdBeginFrame(deviceHandle);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, state.Position);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, state.Transform);
+                double[] buttonState = new double[1];
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttonState);
+                state.Buttons = (int)buttonState[0];
+                HDdll.hdEndFrame(deviceHandle);
+
+                Logger.Log($"GetDeviceState: Position: [{state.Position[0]}, {state.Position[1]}, {state.Position[2]}], Buttons: {state.Buttons}");
+
+                return HDdll.HD_CALLBACK_DONE;
+            }, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
+
+            return state;
         }
 
         public static void Deinitialize()
@@ -130,22 +210,10 @@ namespace ghoh
             {
                 Logger.Log("DeviceManager - Deinitialize called");
 
+                isRunning = false; // Stop the force update loop
+
                 if (deviceHandle != HDdll.HD_INVALID_HANDLE)
                 {
-                    // Disable force
-                    forceEnabled = false;
-
-                    // Schedule a synchronous callback to set force to zero
-                    HDdll.hdScheduleSynchronous(setZeroForceCallbackDelegate, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                    Logger.Log("SetZeroForceCallback scheduled during deinitialization.");
-
-                    if (forceCallbackHandle != IntPtr.Zero)
-                    {
-                        HDdll.hdUnschedule(forceCallbackHandle);
-                        forceCallbackHandle = IntPtr.Zero;
-                        Logger.Log("Force callback unscheduled during deinitialization.");
-                    }
-
                     HDdll.hdStopScheduler();
                     Logger.Log("Scheduler stopped.");
 
@@ -158,83 +226,6 @@ namespace ghoh
                 {
                     Logger.Log("DeviceManager - Device already deinitialized");
                 }
-            }
-        }
-
-        private static uint ForceCallback(IntPtr pData)
-        {
-            try
-            {
-                int deviceHandleLocal = deviceHandle;
-
-                if (!forceEnabled)
-                {
-                    Logger.Log("Force not enabled, stopping ForceCallback.");
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                if (deviceHandleLocal == HDdll.HD_INVALID_HANDLE)
-                {
-                    Logger.Log("Invalid device handle in ForceCallback, stopping callback.");
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                HDdll.hdBeginFrame(deviceHandleLocal);
-                Logger.Log("Begin frame in ForceCallback.");
-
-                // Set the force vector
-                double[] force = currentForce;
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
-                Logger.Log($"Force set to: [{force[0]}, {force[1]}, {force[2]}]");
-
-                HDdll.hdEndFrame(deviceHandleLocal);
-                Logger.Log("End frame in ForceCallback.");
-
-                // Check for errors
-                HDdll.HDErrorInfo error = HDdll.hdGetError();
-                if (error.ErrorCode != HDdll.HD_SUCCESS)
-                {
-                    Logger.Log($"HD Error in ForceCallback: {error.ErrorCode}, Internal Error: {error.InternalErrorCode}");
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                // Continue applying the force
-                return HDdll.HD_CALLBACK_CONTINUE;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogException(ex);
-                return HDdll.HD_CALLBACK_DONE;
-            }
-        }
-
-        private static uint SetZeroForceCallback(IntPtr pData)
-        {
-            try
-            {
-                int deviceHandleLocal = deviceHandle;
-                if (deviceHandleLocal == HDdll.HD_INVALID_HANDLE)
-                {
-                    Logger.Log("Invalid device handle in SetZeroForceCallback.");
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                HDdll.hdBeginFrame(deviceHandleLocal);
-                Logger.Log("Begin frame in SetZeroForceCallback.");
-
-                double[] zeroForce = new double[3] { 0, 0, 0 };
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, zeroForce);
-                Logger.Log("Force set to zero in SetZeroForceCallback.");
-
-                HDdll.hdEndFrame(deviceHandleLocal);
-                Logger.Log("End frame in SetZeroForceCallback.");
-
-                return HDdll.HD_CALLBACK_DONE;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogException(ex);
-                return HDdll.HD_CALLBACK_DONE;
             }
         }
     }
