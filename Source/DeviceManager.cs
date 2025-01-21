@@ -13,7 +13,7 @@ namespace ghoh
         private static bool forceEnabled = false;
         private static bool isRunning = false;
 
-        private static bool loggingEnabled = true;
+        private static bool loggingEnabled = false;
 
         // Keep a reference to the delegate to prevent garbage collection
         private static HDdll.HDSchedulerCallback forceCallbackDelegate = ForceCallback;
