@@ -14,6 +14,8 @@ namespace ghoh
         {
             pManager.AddBooleanParameter("Enable", "E", "Enable or disable force application", GH_ParamAccess.item, false);
             pManager.AddVectorParameter("Force", "F", "Force vector to apply to the device", GH_ParamAccess.item, new Vector3d(0, 0, 0));
+            pManager.AddTransformParameter("Transform", "X", "Optional transform matrix for scaling and additional transformations", GH_ParamAccess.item);
+            pManager[2].Optional = true;
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -27,9 +29,11 @@ namespace ghoh
 
             bool enable = false;
             Vector3d force = new Vector3d();
+            Transform additionalTransform = Transform.Identity;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref force)) return;
+            DA.GetData(2, ref additionalTransform);
 
             Logger.Log($"ghohSetForce - Retrieved force: {force.X},{force.Y},{force.Z}");
             Logger.Log($"ghohSetForce - Retrieved enable: {enable}");
@@ -44,8 +48,25 @@ namespace ghoh
                 return;
             }
 
-            // Convert Rhino Vector3d to double array
-            double[] forceArray = new double[3] { force.X, force.Y, force.Z };
+            // Apply any additional transformation if provided
+            if (!additionalTransform.Equals(Transform.Identity))
+            {
+                Transform inverseTransform = additionalTransform;
+                inverseTransform.TryGetInverse(out inverseTransform);
+                force.Transform(inverseTransform);
+            }
+
+            // Remap the force vector components according to the required transformation:
+            // Rhino -> Device
+            // X -> -X (negative to match coordinate system)
+            // Y -> Z
+            // Z -> Y
+            double[] forceArray = new double[3]
+            {
+                -force.X,    // -X
+                force.Z,     // Y
+                force.Y      // Z
+            };
 
             Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
 

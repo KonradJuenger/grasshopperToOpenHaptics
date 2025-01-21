@@ -12,7 +12,8 @@ namespace ghoh
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
-            // No input parameters needed
+            pManager.AddTransformParameter("Transform", "X", "Optional transform matrix for scaling and additional transformations", GH_ParamAccess.item);
+            pManager[0].Optional = true;
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -24,6 +25,9 @@ namespace ghoh
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Transform additionalTransform = Transform.Identity;
+            DA.GetData(0, ref additionalTransform);
+
             int handle = DeviceManager.DeviceHandle;
             if (handle == HDdll.HD_INVALID_HANDLE)
             {
@@ -34,10 +38,35 @@ namespace ghoh
 
             DeviceManager.DeviceState state = DeviceManager.GetDeviceState();
 
-            var origin = new Point3d(-state.Transform[12], state.Transform[14] + 88.11, state.Transform[13] + 65.51);
-            var yDirection = new Vector3d(-state.Transform[0], state.Transform[2], state.Transform[1]);
-            var xDirection = new Vector3d(-state.Transform[4], state.Transform[6], state.Transform[5]);
+            // Remap axes according to the required transformation:
+            // X -> Z, Y -> X, Z -> Y
+            var origin = new Point3d(
+                -state.Transform[12],    // -X (negative to match coordinate system)
+                state.Transform[14] ,  // Z becomes
+                state.Transform[13]    // Y becomes 
+            );
+
+            // Similarly transform the orientation vectors
+            var xDirection = new Vector3d(
+                -state.Transform[0],     // -X
+                state.Transform[2],      // Z
+                state.Transform[1]       // Y
+            );
+
+            var yDirection = new Vector3d(
+                -state.Transform[4],     // -X
+                state.Transform[6],      // Z
+                state.Transform[5]       // Y
+            );
+
+            // Create plane from transformed vectors
             var plane = new Plane(origin, xDirection, yDirection);
+
+            // Apply any additional transformation if provided
+            if (!additionalTransform.Equals(Transform.Identity))
+            {
+                plane.Transform(additionalTransform);
+            }
 
             bool button1Status = (state.Buttons & 0x01) != 0;
             bool button2Status = (state.Buttons & 0x02) != 0;
