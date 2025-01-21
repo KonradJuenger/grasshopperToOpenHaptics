@@ -2,32 +2,79 @@
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Buffers;
+using System.Threading.Tasks;
+using Rhino.Geometry;
 
 namespace ghoh
 {
+    public class ForceParameters
+    {
+        public bool Enabled { get; set; }
+        public Point3d Target { get; set; }
+        public double MaxForce { get; set; }
+        public double MaxDistance { get; set; }
+        public Transform WorldToDevice { get; set; }
+
+        public ForceParameters()
+        {
+            Enabled = false;
+            Target = Point3d.Origin;
+            MaxForce = 1.0;
+            MaxDistance = 1.0;
+            WorldToDevice = Transform.Identity;
+        }
+    }
+
     public static class DeviceManager
     {
         private static int deviceHandle = HDdll.HD_INVALID_HANDLE;
         private static readonly ReaderWriterLockSlim deviceLock = new ReaderWriterLockSlim();
-        private static IntPtr forceCallbackHandle = IntPtr.Zero;
-        private static double[] currentForce = new double[3];
-        private static bool forceEnabled = false;
-        private static bool isRunning = false;
+        private static readonly object forceParamsLock = new object();
+        private static readonly object stateLock = new object();
+        private static DeviceState _cachedState = new DeviceState();
+        private static ForceParameters currentForceParams = new ForceParameters();
+
+        // Background loop management
+        private static CancellationTokenSource cancellationSource;
+        private static Task positionUpdateTask;
+        private static Task forceUpdateTask;
+        private static volatile bool isRunning = false;
+
+        // Keep arrays pooled for reuse
         private static readonly ArrayPool<double> arrayPool = ArrayPool<double>.Shared;
 
-        // Keep a reference to the delegate to prevent garbage collection
-        private static HDdll.HDSchedulerCallback forceCallbackDelegate = ForceCallback;
-
-        public struct DeviceState
+        public class DeviceState
         {
             public double[] Position;
             public double[] Transform;
             public int Buttons;
 
+            public DeviceState()
+            {
+                Position = null;
+                Transform = null;
+                Buttons = 0;
+            }
+
             public void ReturnArrays()
             {
                 if (Position != null) arrayPool.Return(Position);
                 if (Transform != null) arrayPool.Return(Transform);
+            }
+
+            public DeviceState MakeCopy()
+            {
+                var copy = new DeviceState
+                {
+                    Position = Position != null ? arrayPool.Rent(3) : null,
+                    Transform = Transform != null ? arrayPool.Rent(16) : null,
+                    Buttons = this.Buttons
+                };
+
+                if (this.Position != null) Array.Copy(this.Position, copy.Position, this.Position.Length);
+                if (this.Transform != null) Array.Copy(this.Transform, copy.Transform, this.Transform.Length);
+
+                return copy;
             }
         }
 
@@ -44,6 +91,196 @@ namespace ghoh
                 {
                     deviceLock.ExitReadLock();
                 }
+            }
+        }
+
+        private static void StartBackgroundLoops()
+        {
+            if (isRunning) return;
+
+            cancellationSource = new CancellationTokenSource();
+            var token = cancellationSource.Token;
+            isRunning = true;
+
+            // Position update loop
+            positionUpdateTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested && deviceHandle != HDdll.HD_INVALID_HANDLE)
+                {
+                    try
+                    {
+                        UpdateDeviceState();
+                        await Task.Delay(1, token); // 1ms delay
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogException(ex);
+                    }
+                }
+            }, token);
+
+            // Force update loop
+            forceUpdateTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested && deviceHandle != HDdll.HD_INVALID_HANDLE)
+                {
+                    try
+                    {
+                        UpdateForce();
+                        await Task.Delay(1, token); // 1ms delay
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogException(ex);
+                    }
+                }
+            }, token);
+        }
+
+        private static void StopBackgroundLoops()
+        {
+            if (!isRunning) return;
+
+            isRunning = false;
+            cancellationSource?.Cancel();
+
+            try
+            {
+                Task.WaitAll(new[] { positionUpdateTask, forceUpdateTask }, 1000); // Wait up to 1 second
+            }
+            catch (Exception ex)
+            {
+                Logger.LogException(ex);
+            }
+
+            cancellationSource?.Dispose();
+            cancellationSource = null;
+        }
+
+        private static void UpdateDeviceState()
+        {
+            deviceLock.EnterReadLock();
+            try
+            {
+                if (deviceHandle == HDdll.HD_INVALID_HANDLE) return;
+
+                var newState = new DeviceState
+                {
+                    Position = arrayPool.Rent(3),
+                    Transform = arrayPool.Rent(16)
+                };
+
+                HDdll.hdBeginFrame(deviceHandle);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, newState.Position);
+                HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, newState.Transform);
+
+                double[] buttonState = arrayPool.Rent(1);
+                try
+                {
+                    HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttonState);
+                    newState.Buttons = (int)buttonState[0];
+                }
+                finally
+                {
+                    arrayPool.Return(buttonState);
+                }
+
+                HDdll.hdEndFrame(deviceHandle);
+
+                // Update cached state
+                lock (stateLock)
+                {
+                    var oldState = _cachedState;
+                    _cachedState = newState;
+                    oldState.ReturnArrays();
+                }
+            }
+            finally
+            {
+                deviceLock.ExitReadLock();
+            }
+        }
+
+        private static void UpdateForce()
+        {
+            ForceParameters parameters;
+            lock (forceParamsLock)
+            {
+                parameters = currentForceParams;
+            }
+
+            if (!parameters.Enabled)
+            {
+                ApplyForce(new double[] { 0, 0, 0 }, false);
+                return;
+            }
+
+            // Get current position from cached state
+            DeviceState currentState;
+            lock (stateLock)
+            {
+                currentState = _cachedState.MakeCopy();
+            }
+
+            try
+            {
+                if (currentState.Transform == null) return;
+
+                // Calculate force based on position and target
+                var devicePosition = new Point3d(
+                    -currentState.Transform[12],
+                    currentState.Transform[14],
+                    currentState.Transform[13]
+                );
+
+                Point3d deviceInWorldSpace = devicePosition;
+                if (!parameters.WorldToDevice.Equals(Transform.Identity))
+                {
+                    deviceInWorldSpace.Transform(parameters.WorldToDevice);
+                }
+
+                Vector3d totalForce = Vector3d.Zero;
+                var directionToTarget = parameters.Target - deviceInWorldSpace;
+                var distance = directionToTarget.Length;
+
+                if (distance > 0.001)
+                {
+                    var normalizedDir = directionToTarget / distance;
+
+                    if (distance > parameters.MaxDistance)
+                    {
+                        totalForce = normalizedDir * parameters.MaxForce;
+                    }
+                    else
+                    {
+                        var scale = parameters.MaxForce * (distance / parameters.MaxDistance);
+                        totalForce = normalizedDir * scale;
+                    }
+
+                    // Transform force back to device space
+                    if (!parameters.WorldToDevice.Equals(Transform.Identity))
+                    {
+                        Transform deviceToWorld = parameters.WorldToDevice;
+                        if (deviceToWorld.TryGetInverse(out deviceToWorld))
+                        {
+                            totalForce.Transform(deviceToWorld);
+                        }
+                    }
+                }
+
+                // Apply force to device
+                double[] forceArray = new double[]
+                {
+                    -totalForce.X,
+                    totalForce.Z,
+                    totalForce.Y
+                };
+
+                ApplyForce(forceArray, true);
+            }
+            finally
+            {
+                currentState.ReturnArrays();
             }
         }
 
@@ -65,7 +302,6 @@ namespace ghoh
                     HDdll.HDErrorInfo err = HDdll.hdGetError();
                     IntPtr errPtr = HDdll.hdGetErrorString(err.ErrorCode);
                     errorMessage = Marshal.PtrToStringAnsi(errPtr);
-                    deviceHandle = HDdll.HD_INVALID_HANDLE;
                     return false;
                 }
 
@@ -73,9 +309,8 @@ namespace ghoh
                 HDdll.hdEnable(HDdll.HD_FORCE_OUTPUT);
                 HDdll.hdStartScheduler();
 
-                isRunning = true;
-                Thread forceThread = new Thread(ForceUpdateLoop);
-                forceThread.Start();
+                // Start background loops
+                StartBackgroundLoops();
 
                 errorMessage = null;
                 return true;
@@ -86,19 +321,25 @@ namespace ghoh
             }
         }
 
-        public static void ApplyForce(double[] force, bool enable)
+        public static void Deinitialize()
         {
             deviceLock.EnterWriteLock();
             try
             {
-                forceEnabled = enable;
-                if (enable)
+                StopBackgroundLoops();
+
+                if (deviceHandle != HDdll.HD_INVALID_HANDLE)
                 {
-                    Array.Copy(force, currentForce, 3);
+                    HDdll.hdStopScheduler();
+                    HDdll.hdDisableDevice(deviceHandle);
+                    deviceHandle = HDdll.HD_INVALID_HANDLE;
                 }
-                else
+
+                // Clear cached state
+                lock (stateLock)
                 {
-                    Array.Clear(currentForce, 0, currentForce.Length);
+                    _cachedState.ReturnArrays();
+                    _cachedState = new DeviceState();
                 }
             }
             finally
@@ -107,128 +348,32 @@ namespace ghoh
             }
         }
 
-        private static void ForceUpdateLoop()
+        public static DeviceState GetCurrentState()
         {
-            var spinWait = new SpinWait();
-            while (isRunning)
+            lock (stateLock)
             {
-                try
-                {
-                    HDdll.hdScheduleSynchronous(ForceCallback, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                    spinWait.SpinOnce();
-                }
-                catch
-                {
-                    // Logging is disabled as per requirement
-                }
+                return _cachedState.MakeCopy();
             }
         }
 
-        private static uint ForceCallback(IntPtr userData)
+        public static void UpdateForceParameters(ForceParameters parameters)
         {
-            deviceLock.EnterReadLock();
-            try
+            lock (forceParamsLock)
             {
-                if (deviceHandle == HDdll.HD_INVALID_HANDLE)
-                {
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                HDdll.hdBeginFrame(deviceHandle);
-
-                if (forceEnabled)
-                {
-                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, currentForce);
-                }
-                else
-                {
-                    double[] zeroForce = arrayPool.Rent(3);
-                    try
-                    {
-                        Array.Clear(zeroForce, 0, zeroForce.Length);
-                        HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, zeroForce);
-                    }
-                    finally
-                    {
-                        arrayPool.Return(zeroForce);
-                    }
-                }
-
-                HDdll.hdEndFrame(deviceHandle);
-
-                HDdll.HDErrorInfo error = HDdll.hdGetError();
-                if (error.ErrorCode != HDdll.HD_SUCCESS)
-                {
-                    return HDdll.HD_CALLBACK_DONE;
-                }
-
-                return HDdll.HD_CALLBACK_DONE;
-            }
-            finally
-            {
-                deviceLock.ExitReadLock();
+                currentForceParams = parameters;
             }
         }
 
-        public static DeviceState GetDeviceState()
-        {
-            var state = new DeviceState
-            {
-                Position = arrayPool.Rent(3),
-                Transform = arrayPool.Rent(16),
-                Buttons = 0
-            };
-
-            deviceLock.EnterReadLock();
-            try
-            {
-                if (deviceHandle == HDdll.HD_INVALID_HANDLE)
-                {
-                    state.ReturnArrays();
-                    return new DeviceState();
-                }
-
-                double[] buttonState = arrayPool.Rent(1);
-                try
-                {
-                    HDdll.hdScheduleSynchronous((_) =>
-                    {
-                        HDdll.hdBeginFrame(deviceHandle);
-                        HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, state.Position);
-                        HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, state.Transform);
-                        HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttonState);
-                        state.Buttons = (int)buttonState[0];
-                        HDdll.hdEndFrame(deviceHandle);
-
-                        return HDdll.HD_CALLBACK_DONE;
-                    }, IntPtr.Zero, HDdll.HD_DEFAULT_SCHEDULER_PRIORITY);
-                }
-                finally
-                {
-                    arrayPool.Return(buttonState);
-                }
-
-                return state;
-            }
-            finally
-            {
-                deviceLock.ExitReadLock();
-            }
-        }
-
-        public static void Deinitialize()
+        public static void ApplyForce(double[] force, bool enable)
         {
             deviceLock.EnterWriteLock();
             try
             {
-                isRunning = false;
+                if (deviceHandle == HDdll.HD_INVALID_HANDLE) return;
 
-                if (deviceHandle != HDdll.HD_INVALID_HANDLE)
-                {
-                    HDdll.hdStopScheduler();
-                    HDdll.hdDisableDevice(deviceHandle);
-                    deviceHandle = HDdll.HD_INVALID_HANDLE;
-                }
+                HDdll.hdBeginFrame(deviceHandle);
+                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+                HDdll.hdEndFrame(deviceHandle);
             }
             finally
             {

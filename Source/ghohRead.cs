@@ -36,46 +36,53 @@ namespace ghoh
                 return;
             }
 
-            DeviceManager.DeviceState state = DeviceManager.GetDeviceState();
-
-            // Remap axes according to the required transformation:
-            // X -> Z, Y -> X, Z -> Y
-            var origin = new Point3d(
-                -state.Transform[12],    // -X (negative to match coordinate system)
-                state.Transform[14] ,  // Z becomes
-                state.Transform[13]    // Y becomes 
-            );
-
-            // Similarly transform the orientation vectors
-            var xDirection = new Vector3d(
-                -state.Transform[0],     // -X
-                state.Transform[2],      // Z
-                state.Transform[1]       // Y
-            );
-
-            var yDirection = new Vector3d(
-                -state.Transform[4],     // -X
-                state.Transform[6],      // Z
-                state.Transform[5]       // Y
-            );
-
-            // Create plane from transformed vectors
-            var plane = new Plane(origin, xDirection, yDirection);
-
-            // Apply any additional transformation if provided
-            if (!additionalTransform.Equals(Transform.Identity))
+            // Get cached state instead of querying device directly
+            DeviceManager.DeviceState state = DeviceManager.GetCurrentState();
+            try
             {
-                plane.Transform(additionalTransform);
+                // Remap axes according to the required transformation:
+                // X -> Z, Y -> X, Z -> Y
+                var origin = new Point3d(
+                    -state.Transform[12],    // -X (negative to match coordinate system)
+                    state.Transform[14],     // Z becomes Y
+                    state.Transform[13]      // Y becomes Z
+                );
+
+                // Similarly transform the orientation vectors
+                var xDirection = new Vector3d(
+                    -state.Transform[0],     // -X
+                    state.Transform[2],      // Z
+                    state.Transform[1]       // Y
+                );
+
+                var yDirection = new Vector3d(
+                    -state.Transform[4],     // -X
+                    state.Transform[6],      // Z
+                    state.Transform[5]       // Y
+                );
+
+                // Create plane from transformed vectors
+                var plane = new Plane(origin, xDirection, yDirection);
+
+                // Apply any additional transformation if provided
+                if (!additionalTransform.Equals(Transform.Identity))
+                {
+                    plane.Transform(additionalTransform);
+                }
+
+                bool button1Status = (state.Buttons & 0x01) != 0;
+                bool button2Status = (state.Buttons & 0x02) != 0;
+
+                DA.SetData(0, plane);
+                DA.SetData(1, button1Status);
+                DA.SetData(2, button2Status);
+
+                Logger.Log($"ghohRead component output - Plane: Origin ({origin}), XDir ({xDirection}), YDir ({yDirection}), Button1: {button1Status}, Button2: {button2Status}");
             }
-
-            bool button1Status = (state.Buttons & 0x01) != 0;
-            bool button2Status = (state.Buttons & 0x02) != 0;
-
-            DA.SetData(0, plane);
-            DA.SetData(1, button1Status);
-            DA.SetData(2, button2Status);
-
-            Logger.Log($"ghohRead component output Plane: Origin ({origin}), XDir ({xDirection}), YDir ({yDirection}), Button1: {button1Status}, Button2: {button2Status}");
+            finally
+            {
+                state.ReturnArrays(); // Return arrays to pool
+            }
         }
 
         protected override System.Drawing.Bitmap Icon => null;

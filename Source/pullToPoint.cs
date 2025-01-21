@@ -6,8 +6,6 @@ namespace ghoh
 {
     public class ghohPullToPoint : GH_Component
     {
-        private readonly object stateLock = new object();
-        private Point3d previousPosition = Point3d.Origin;
         private DateTime lastLogTime = DateTime.MinValue;
         private const double LOG_INTERVAL_SECONDS = 0.5;
 
@@ -71,47 +69,47 @@ namespace ghoh
 
             bool shouldLogThisIteration = ShouldLog();
 
-            var state = DeviceManager.GetDeviceState();
+            // Update force parameters in DeviceManager
+            var parameters = new ForceParameters
+            {
+                Enabled = enable,
+                Target = target,
+                MaxForce = maxForce,
+                MaxDistance = maxDistance,
+                WorldToDevice = worldToDevice
+            };
 
-            // Get raw device position in device coordinates
-            var devicePosition = new Point3d(
-                -state.Transform[12],
-                state.Transform[14],
-                state.Transform[13]
-            );
+            DeviceManager.UpdateForceParameters(parameters);
 
             if (shouldLogThisIteration)
             {
-                Logger.Log($"PullToPoint - Raw device position: {PointToString(devicePosition)}");
-                Logger.Log($"PullToPoint - Target position: {PointToString(target)}");
+                Logger.Log($"PullToPoint - Parameters updated: Enable={enable}, Target={target}, MaxForce={maxForce}, MaxDistance={maxDistance}");
             }
 
-            // Transform device position to world space
-            Point3d deviceInWorldSpace = devicePosition;
-            if (!worldToDevice.Equals(Transform.Identity))
+            // Get current state for output parameters
+            var state = DeviceManager.GetCurrentState();
+            try
             {
-                deviceInWorldSpace.Transform(worldToDevice);
-                if (shouldLogThisIteration)
+                // Get current device position in world space
+                var devicePosition = new Point3d(
+                    -state.Transform[12],
+                    state.Transform[14],
+                    state.Transform[13]
+                );
+
+                Point3d deviceInWorldSpace = devicePosition;
+                if (!worldToDevice.Equals(Transform.Identity))
                 {
-                    Logger.Log($"PullToPoint - Device in world space: {PointToString(deviceInWorldSpace)}");
+                    deviceInWorldSpace.Transform(worldToDevice);
                 }
-            }
 
-            Vector3d totalForce = Vector3d.Zero;
-
-            if (enable)
-            {
-                // Calculate force based on distance to target
+                // Calculate current direction and distance to target (for output only)
                 var directionToTarget = target - deviceInWorldSpace;
                 var distance = directionToTarget.Length;
 
-                if (shouldLogThisIteration)
-                {
-                    Logger.Log($"PullToPoint - Direction to target: {VectorToString(directionToTarget)}");
-                    Logger.Log($"PullToPoint - Distance: {distance}");
-                }
-
-                if (distance > 0.001)
+                // Calculate current force vector (for output only)
+                Vector3d totalForce = Vector3d.Zero;
+                if (enable && distance > 0.001)
                 {
                     var normalizedDir = directionToTarget / distance;
 
@@ -126,56 +124,19 @@ namespace ghoh
                     }
                 }
 
-                // Transform force back to device space
-                if (!worldToDevice.Equals(Transform.Identity))
-                {
-                    Transform deviceToWorld = worldToDevice;
-                    if (deviceToWorld.TryGetInverse(out deviceToWorld))
-                    {
-                        Vector3d forceInDevice = totalForce;
-                        forceInDevice.Transform(deviceToWorld);
-                        totalForce = forceInDevice;
-
-                        if (shouldLogThisIteration)
-                        {
-                            Logger.Log($"PullToPoint - Force in device space: {VectorToString(totalForce)}");
-                        }
-                    }
-                }
-
-                // Convert to device force array
-                double[] forceArray = new double[]
-                {
-                    -totalForce.X,  // Negated for device space
-                    totalForce.Z,   // Y becomes Z
-                    totalForce.Y    // Z becomes Y
-                };
+                DA.SetData(0, totalForce);
+                DA.SetData(1, distance);
+                DA.SetData(2, deviceInWorldSpace);
 
                 if (shouldLogThisIteration)
                 {
-                    Logger.Log($"PullToPoint - Final force array: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}]");
+                    Logger.Log($"PullToPoint - Outputs: Force={totalForce}, Distance={distance}, DevicePos={deviceInWorldSpace}");
                 }
-
-                DeviceManager.ApplyForce(forceArray, true);
             }
-            else
+            finally
             {
-                DeviceManager.ApplyForce(new double[] { 0, 0, 0 }, false);
+                state.ReturnArrays();
             }
-
-            DA.SetData(0, totalForce);
-            DA.SetData(1, deviceInWorldSpace.DistanceTo(target));
-            DA.SetData(2, deviceInWorldSpace);
-        }
-
-        private string PointToString(Point3d pt)
-        {
-            return $"({pt.X:F6},{pt.Y:F6},{pt.Z:F6})";
-        }
-
-        private string VectorToString(Vector3d vec)
-        {
-            return $"({vec.X:F6},{vec.Y:F6},{vec.Z:F6})";
         }
 
         protected override System.Drawing.Bitmap Icon => null;
