@@ -102,15 +102,16 @@ namespace ghoh
             var token = cancellationSource.Token;
             isRunning = true;
 
-            // Position update loop
-            positionUpdateTask = Task.Run(async () =>
+            // Position update loop with SpinWait
+            var positionSpinWait = new SpinWait();
+            positionUpdateTask = Task.Run(() =>
             {
                 while (!token.IsCancellationRequested && deviceHandle != HDdll.HD_INVALID_HANDLE)
                 {
                     try
                     {
                         UpdateDeviceState();
-                        await Task.Delay(1, token); // 1ms delay
+                        positionSpinWait.SpinOnce(); // More precise timing than Task.Delay
                     }
                     catch (Exception ex)
                     {
@@ -119,15 +120,16 @@ namespace ghoh
                 }
             }, token);
 
-            // Force update loop
-            forceUpdateTask = Task.Run(async () =>
+            // Force update loop with SpinWait
+            var forceSpinWait = new SpinWait();
+            forceUpdateTask = Task.Run(() =>
             {
                 while (!token.IsCancellationRequested && deviceHandle != HDdll.HD_INVALID_HANDLE)
                 {
                     try
                     {
                         UpdateForce();
-                        await Task.Delay(1, token); // 1ms delay
+                        forceSpinWait.SpinOnce(); // More precise timing than Task.Delay
                     }
                     catch (Exception ex)
                     {
