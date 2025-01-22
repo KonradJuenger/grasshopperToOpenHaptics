@@ -6,9 +6,6 @@ namespace ghoh
 {
     public class ghohPullToPoint : GH_Component
     {
-        private DateTime lastLogTime = DateTime.MinValue;
-        private const double LOG_INTERVAL_SECONDS = 0.5;
-
         public ghohPullToPoint() : base(
             "ghohPullToPoint",
             "PullPoint",
@@ -35,17 +32,6 @@ namespace ghoh
             pManager.AddPointParameter("DevicePos", "P", "Current device position", GH_ParamAccess.item);
         }
 
-        private bool ShouldLog()
-        {
-            var now = DateTime.Now;
-            if ((now - lastLogTime).TotalSeconds >= LOG_INTERVAL_SECONDS)
-            {
-                lastLogTime = now;
-                return true;
-            }
-            return false;
-        }
-
         protected override void SolveInstance(IGH_DataAccess DA)
         {
             var handle = DeviceManager.DeviceHandle;
@@ -67,71 +53,63 @@ namespace ghoh
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
 
-            bool shouldLogThisIteration = ShouldLog();
-
-            // Update force parameters in DeviceManager
-            var parameters = new ForceParameters
-            {
-                Enabled = enable,
-                Target = target,
-                MaxForce = maxForce,
-                MaxDistance = maxDistance,
-                WorldToDevice = worldToDevice
-            };
-
-            DeviceManager.UpdateForceParameters(parameters);
-
-            if (shouldLogThisIteration)
-            {
-                Logger.Log($"PullToPoint - Parameters updated: Enable={enable}, Target={target}, MaxForce={maxForce}, MaxDistance={maxDistance}");
-            }
-
-            // Get current state for output parameters
+            // Get current state before transforming target
             var state = DeviceManager.GetCurrentState();
+
             try
             {
-                // Get current device position in world space
+                // Get device position in its native coordinate system
                 var devicePosition = new Point3d(
-                    -state.Transform[12],
-                    state.Transform[14],
-                    state.Transform[13]
+                    -state.Transform[12],    // -X (negative to match coordinate system)
+                    state.Transform[14],     // Z becomes Y
+                    state.Transform[13]      // Y becomes Z
                 );
 
-                Point3d deviceInWorldSpace = devicePosition;
+                Point3d transformedDevicePos = devicePosition;
+                Point3d transformedTarget = target;
+
+                // Apply world-to-device transformation if provided
                 if (!worldToDevice.Equals(Transform.Identity))
                 {
-                    deviceInWorldSpace.Transform(worldToDevice);
+                    transformedDevicePos.Transform(worldToDevice);
+
+                    Transform deviceToWorld = worldToDevice;
+                    if (deviceToWorld.TryGetInverse(out deviceToWorld))
+                    {
+                        transformedTarget.Transform(deviceToWorld);
+                    }
                 }
 
-                // Calculate current direction and distance to target (for output only)
-                var directionToTarget = target - deviceInWorldSpace;
-                var distance = directionToTarget.Length;
+                // Calculate direction and distance for visualization
+                Vector3d currentForce = Vector3d.Zero;
+                double distance = transformedDevicePos.DistanceTo(transformedTarget);
 
-                // Calculate current force vector (for output only)
-                Vector3d totalForce = Vector3d.Zero;
                 if (enable && distance > 0.001)
                 {
-                    var normalizedDir = directionToTarget / distance;
+                    // Calculate direction
+                    Vector3d direction = transformedTarget - transformedDevicePos;
+                    direction.Unitize();
 
-                    if (distance > maxDistance)
-                    {
-                        totalForce = normalizedDir * maxForce;
-                    }
-                    else
-                    {
-                        var scale = maxForce * (distance / maxDistance);
-                        totalForce = normalizedDir * scale;
-                    }
+                    // Calculate force magnitude
+                    double forceMagnitude = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
+
+                    // Calculate force vector for visualization
+                    currentForce = direction * forceMagnitude;
                 }
 
-                DA.SetData(0, totalForce);
+                // Update target in DeviceManager for servo loop
+                var targetVector = new DeviceManager.Vector3D(
+                    transformedTarget.X,
+                    transformedTarget.Y,
+                    transformedTarget.Z
+                );
+
+                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance);
+
+                // Output results
+                DA.SetData(0, currentForce);
                 DA.SetData(1, distance);
-                DA.SetData(2, deviceInWorldSpace);
-
-                if (shouldLogThisIteration)
-                {
-                    Logger.Log($"PullToPoint - Outputs: Force={totalForce}, Distance={distance}, DevicePos={deviceInWorldSpace}");
-                }
+                DA.SetData(2, transformedDevicePos);
             }
             finally
             {
