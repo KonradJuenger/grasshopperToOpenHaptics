@@ -6,6 +6,9 @@ namespace ghoh
 {
     public class ghohPullToPoint : GH_Component
     {
+        private DateTime lastUpdateTime = DateTime.MinValue;
+        private Vector3d lastForce = Vector3d.Zero;
+
         public ghohPullToPoint() : base(
             "ghohPullToPoint",
             "PullPoint",
@@ -24,8 +27,8 @@ namespace ghoh
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Interpolate", "I", "Enable target interpolation for smoother transitions", GH_ParamAccess.item, false);
             pManager.AddNumberParameter("InterpolationWindow", "W", "Time window for interpolation (milliseconds)", GH_ParamAccess.item, 30.0);
+            pManager.AddNumberParameter("UpdateInterval", "U", "Output update interval in milliseconds (10-5000)", GH_ParamAccess.item, 100.0);
 
-            // Make transform and interpolation parameters optional
             pManager[4].Optional = true;  // Transform
             pManager[5].Optional = true;  // Interpolate
         }
@@ -33,8 +36,6 @@ namespace ghoh
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
             pManager.AddVectorParameter("Force", "F", "Current force vector", GH_ParamAccess.item);
-            pManager.AddNumberParameter("Distance", "L", "Distance to target", GH_ParamAccess.item);
-            pManager.AddPointParameter("DevicePos", "P", "Current device position", GH_ParamAccess.item);
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
@@ -53,6 +54,7 @@ namespace ghoh
             Transform worldToDevice = Transform.Identity;
             bool interpolate = false;
             double interpolationWindow = 30.0;
+            double updateInterval = 100.0;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref target)) return;
@@ -61,7 +63,14 @@ namespace ghoh
             DA.GetData(4, ref worldToDevice);
             DA.GetData(5, ref interpolate);
             DA.GetData(6, ref interpolationWindow);
-            interpolationWindow = Math.Max(1.0, interpolationWindow);
+            DA.GetData(7, ref updateInterval);
+
+            // Clamp update interval
+            updateInterval = Math.Max(10.0, Math.Min(5000.0, updateInterval));
+
+            // Check if enough time has passed to update output
+            var currentTime = DateTime.Now;
+            bool shouldUpdateOutput = (currentTime - lastUpdateTime).TotalMilliseconds >= updateInterval;
 
             var state = DeviceManager.GetCurrentState();
 
@@ -85,13 +94,12 @@ namespace ghoh
                     }
                 }
 
-                // Calculate direction and distance (both points now in device space)
+                // Calculate direction and distance (both points in device space)
                 double distance = devicePosition.DistanceTo(transformedTarget);
                 Vector3d currentForce = Vector3d.Zero;
 
                 if (enable && distance > 0.001)
                 {
-                    // Calculate direction in device space
                     Vector3d direction = transformedTarget - devicePosition;
                     direction.Unitize();
 
@@ -108,10 +116,15 @@ namespace ghoh
                         forceMagnitude = maxForce * (Math.Sin(t * Math.PI / 2));
                     }
 
-                    currentForce = direction * forceMagnitude;
+                    // For display, convert device space direction to Rhino world space
+                    currentForce = new Vector3d(
+                        direction.Y,    // Device X -> -Rhino X
+                        -direction.X,     // Device Z -> Rhino Y
+                        direction.Z      // Device Y -> Rhino Z
+                    ) * forceMagnitude;
                 }
 
-                // Update target in DeviceManager for servo loop
+                // Update target in DeviceManager for servo loop (stays in device space)
                 var targetVector = new DeviceManager.Vector3D(
                     transformedTarget.X,
                     transformedTarget.Y,
@@ -127,17 +140,15 @@ namespace ghoh
                     interpolationWindow
                 );
 
-                // Transform device position to world space for visualization
-                Point3d worldDevicePos = devicePosition;
-                if (!worldToDevice.Equals(Transform.Identity))
+                // Update output only if enough time has passed
+                if (shouldUpdateOutput)
                 {
-                    worldDevicePos.Transform(worldToDevice);
+                    lastForce = currentForce;
+                    lastUpdateTime = currentTime;
                 }
 
-                // Output results
-                DA.SetData(0, currentForce);
-                DA.SetData(1, distance);
-                DA.SetData(2, worldDevicePos);  // Output in world space for visualization
+                // Always output last force (either updated or previous)
+                DA.SetData(0, lastForce);
             }
             finally
             {

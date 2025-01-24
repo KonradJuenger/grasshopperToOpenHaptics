@@ -28,9 +28,7 @@ namespace ghoh
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
-            pManager.AddVectorParameter("Force", "F", "Current force vector", GH_ParamAccess.item);
-            pManager.AddNumberParameter("Distance", "L", "Distance to target", GH_ParamAccess.item);
-            pManager.AddPointParameter("DevicePos", "P", "Current device position", GH_ParamAccess.item);
+            // No outputs
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
@@ -76,17 +74,14 @@ namespace ghoh
                     }
                 }
 
-                // Calculate direction and distance (both points now in device space)
+                // Calculate direction and distance (both points in device space)
                 double distance = devicePosition.DistanceTo(transformedTarget);
                 Vector3d currentForce = Vector3d.Zero;
 
                 if (enable && distance > 0.001)
                 {
-                    // Calculate direction in device space
                     Vector3d direction = transformedTarget - devicePosition;
                     direction.Unitize();
-
-                    // Calculate force magnitude
                     double forceMagnitude = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
                     currentForce = direction * forceMagnitude;
                 }
@@ -98,20 +93,7 @@ namespace ghoh
                     transformedTarget.Z
                 );
 
-                // Interpolation disabled
                 DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
-
-                // Transform device position to world space for visualization
-                Point3d worldDevicePos = devicePosition;
-                if (!worldToDevice.Equals(Transform.Identity))
-                {
-                    worldDevicePos.Transform(worldToDevice);
-                }
-
-                // Output results
-                DA.SetData(0, currentForce);
-                DA.SetData(1, distance);
-                DA.SetData(2, worldDevicePos);  // Output in world space for visualization
             }
             finally
             {
