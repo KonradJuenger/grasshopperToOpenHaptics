@@ -22,7 +22,11 @@ namespace ghoh
             pManager.AddNumberParameter("MaxForce", "F", "Maximum force to apply", GH_ParamAccess.item, 1.0);
             pManager.AddNumberParameter("MaxDistance", "D", "Distance at which force becomes constant", GH_ParamAccess.item, 1.0);
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
-            pManager[4].Optional = true;
+            pManager.AddBooleanParameter("Interpolate", "I", "Enable target interpolation for smoother transitions", GH_ParamAccess.item, false);
+
+            // Make transform and interpolation parameters optional
+            pManager[4].Optional = true;  // Transform
+            pManager[5].Optional = true;  // Interpolate
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -46,6 +50,8 @@ namespace ghoh
             double maxForce = 1.0;
             double maxDistance = 1.0;
             Transform worldToDevice = Transform.Identity;
+            bool interpolate = false;
+            DA.GetData(5, ref interpolate);
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref target)) return;
@@ -104,8 +110,8 @@ namespace ghoh
                     transformedTarget.Z
                 );
 
-                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance);
-
+                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, interpolate);
+                
                 // Output results
                 DA.SetData(0, currentForce);
                 DA.SetData(1, distance);

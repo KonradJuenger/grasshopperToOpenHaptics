@@ -22,6 +22,12 @@ namespace ghoh
         private static double maxDistanceValue = 1.0;
         private static long isRunningFlag; // 0 = false, 1 = true
 
+        // interpolation parameters
+        private static Vector3D previousTarget;
+        private static Vector3D currentInterpolatedTarget;
+        private static DateTime lastTargetUpdateTime = DateTime.MinValue;
+        private static bool interpolationEnabled = false;
+
         // Struct to hold device state
         public struct DeviceState
         {
@@ -180,8 +186,10 @@ namespace ghoh
 
         private static void CalculateAndApplyForce(double[] position)
         {
+
             // Get current target and parameters
-            var target = targetPoint;
+            UpdateInterpolatedTarget();
+            var target = currentInterpolatedTarget;
             var maxForce = maxForceValue;
             var maxDistance = maxDistanceValue;
 
@@ -247,14 +255,44 @@ namespace ghoh
             }
         }
 
-        public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD)
+        public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD, bool useInterpolation)
         {
+            interpolationEnabled = useInterpolation;
+
+            if (interpolationEnabled)
+            {
+                previousTarget = currentInterpolatedTarget;
+                lastTargetUpdateTime = DateTime.Now;
+            }
+            else
+            {
+                currentInterpolatedTarget = target;
+            }
+
             targetPoint = target;
             Interlocked.Exchange(ref forceEnabledFlag, enable ? 1 : 0);
             maxForceValue = maxF;
             maxDistanceValue = maxD;
         }
+        private static void UpdateInterpolatedTarget()
+        {
+            if (!interpolationEnabled || lastTargetUpdateTime == DateTime.MinValue)
+            {
+                currentInterpolatedTarget = targetPoint;
+                return;
+            }
 
+            double elapsedMs = (DateTime.Now - lastTargetUpdateTime).TotalMilliseconds;
+            double t = Math.Min(Math.Max(elapsedMs / 30.0, 0.0), 1.0); // 30ms interpolation window
+
+            currentInterpolatedTarget = new Vector3D(
+                previousTarget.X + (targetPoint.X - previousTarget.X) * t,
+                previousTarget.Y + (targetPoint.Y - previousTarget.Y) * t,
+                previousTarget.Z + (targetPoint.Z - previousTarget.Z) * t
+            );
+
+            if (t >= 1.0) interpolationEnabled = false;
+        }
         public static void ApplyForce(double[] force, bool enable)
         {
             if (enable)
