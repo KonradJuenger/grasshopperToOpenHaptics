@@ -27,7 +27,7 @@ namespace ghoh
         private static Vector3D currentInterpolatedTarget;
         private static DateTime lastTargetUpdateTime = DateTime.MinValue;
         private static bool interpolationEnabled = false;
-
+        private static double interpolationTimeWindow = 30.0; 
         // Struct to hold device state
         public struct DeviceState
         {
@@ -255,10 +255,10 @@ namespace ghoh
             }
         }
 
-        public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD, bool useInterpolation)
+        public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD, bool useInterpolation, double interpolationWindow)
         {
             interpolationEnabled = useInterpolation;
-
+            interpolationTimeWindow = Math.Max(1.0, interpolationWindow); // Update interpolation window
             if (interpolationEnabled)
             {
                 previousTarget = currentInterpolatedTarget;

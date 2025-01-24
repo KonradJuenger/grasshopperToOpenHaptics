@@ -23,6 +23,7 @@ namespace ghoh
             pManager.AddNumberParameter("MaxDistance", "D", "Distance at which force becomes constant", GH_ParamAccess.item, 1.0);
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Interpolate", "I", "Enable target interpolation for smoother transitions", GH_ParamAccess.item, false);
+            pManager.AddNumberParameter("InterpolationWindow", "W", "Time window for interpolation (milliseconds)", GH_ParamAccess.item, 30.0);
 
             // Make transform and interpolation parameters optional
             pManager[4].Optional = true;  // Transform
@@ -51,14 +52,16 @@ namespace ghoh
             double maxDistance = 1.0;
             Transform worldToDevice = Transform.Identity;
             bool interpolate = false;
-            DA.GetData(5, ref interpolate);
+            double interpolationWindow = 30.0;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref target)) return;
             if (!DA.GetData(2, ref maxForce)) return;
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
-
+            DA.GetData(5, ref interpolate);
+            DA.GetData(6, ref interpolationWindow);
+            interpolationWindow = Math.Max(1.0, interpolationWindow); // Ensure minimum 1ms
             // Get current state before transforming target
             var state = DeviceManager.GetCurrentState();
 
@@ -110,8 +113,9 @@ namespace ghoh
                     transformedTarget.Z
                 );
 
-                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, interpolate);
-                
+                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, interpolate, interpolationWindow);
+            
+
                 // Output results
                 DA.SetData(0, currentForce);
                 DA.SetData(1, distance);
