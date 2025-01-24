@@ -4,12 +4,12 @@ using System;
 
 namespace ghoh
 {
-    public class ghohPullToPoint : GH_Component
+    public class ghohPullToPointSimple : GH_Component
     {
-        public ghohPullToPoint() : base(
-            "ghohPullToPoint",
-            "PullPoint",
-            "Pulls the haptic device to a point with proportional force based on distance",
+        public ghohPullToPointSimple() : base(
+            "ghohPullToPointSimple",
+            "PullPointSimple",
+            "Simplified version that pulls the haptic device to a point with proportional force based on distance",
             "ghoh",
             "device")
         {
@@ -22,12 +22,8 @@ namespace ghoh
             pManager.AddNumberParameter("MaxForce", "F", "Maximum force to apply", GH_ParamAccess.item, 1.0);
             pManager.AddNumberParameter("MaxDistance", "D", "Distance at which force becomes constant", GH_ParamAccess.item, 1.0);
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
-            pManager.AddBooleanParameter("Interpolate", "I", "Enable target interpolation for smoother transitions", GH_ParamAccess.item, false);
-            pManager.AddNumberParameter("InterpolationWindow", "W", "Time window for interpolation (milliseconds)", GH_ParamAccess.item, 30.0);
 
-            // Make transform and interpolation parameters optional
             pManager[4].Optional = true;  // Transform
-            pManager[5].Optional = true;  // Interpolate
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -51,17 +47,12 @@ namespace ghoh
             double maxForce = 1.0;
             double maxDistance = 1.0;
             Transform worldToDevice = Transform.Identity;
-            bool interpolate = false;
-            double interpolationWindow = 30.0;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref target)) return;
             if (!DA.GetData(2, ref maxForce)) return;
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
-            DA.GetData(5, ref interpolate);
-            DA.GetData(6, ref interpolationWindow);
-            interpolationWindow = Math.Max(1.0, interpolationWindow);
 
             var state = DeviceManager.GetCurrentState();
 
@@ -95,19 +86,8 @@ namespace ghoh
                     Vector3d direction = transformedTarget - devicePosition;
                     direction.Unitize();
 
-                    // Calculate force magnitude with smoothing at maxDistance
-                    double forceMagnitude;
-                    if (distance >= maxDistance)
-                    {
-                        forceMagnitude = maxForce;
-                    }
-                    else
-                    {
-                        // Smooth transition near maxDistance using sine curve
-                        double t = distance / maxDistance;
-                        forceMagnitude = maxForce * (Math.Sin(t * Math.PI / 2));
-                    }
-
+                    // Calculate force magnitude
+                    double forceMagnitude = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
                     currentForce = direction * forceMagnitude;
                 }
 
@@ -118,14 +98,8 @@ namespace ghoh
                     transformedTarget.Z
                 );
 
-                DeviceManager.UpdateTargetPoint(
-                    targetVector,
-                    enable,
-                    maxForce,
-                    maxDistance,
-                    interpolate,
-                    interpolationWindow
-                );
+                // Interpolation disabled
+                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
 
                 // Transform device position to world space for visualization
                 Point3d worldDevicePos = devicePosition;
@@ -147,6 +121,6 @@ namespace ghoh
 
         protected override System.Drawing.Bitmap Icon => null;
 
-        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c69d");
+        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c69e");
     }
 }
