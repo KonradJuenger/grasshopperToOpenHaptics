@@ -63,37 +63,56 @@ namespace ghoh
                     state.Transform[13]      // Y becomes Z
                 );
 
-                // Transform target to device space if transform provided
-                Point3d transformedTarget = target;
+                // Transform device position to world space
+                Point3d transformedDevicePos = devicePosition;
                 if (!worldToDevice.Equals(Transform.Identity))
                 {
-                    Transform deviceToWorld = worldToDevice;
-                    if (deviceToWorld.TryGetInverse(out deviceToWorld))
-                    {
-                        transformedTarget.Transform(deviceToWorld);
-                    }
+                    transformedDevicePos.Transform(worldToDevice);
                 }
 
-                // Calculate direction and distance (both points in device space)
-                double distance = devicePosition.DistanceTo(transformedTarget);
-                Vector3d currentForce = Vector3d.Zero;
+                // Calculate direction and distance in world space
+                double distance = transformedDevicePos.DistanceTo(target);
 
                 if (enable && distance > 0.001)
                 {
-                    Vector3d direction = transformedTarget - devicePosition;
+                    Vector3d direction = target - transformedDevicePos;
                     direction.Unitize();
+
+                    // Convert world space direction to device space for force
+                    Vector3d deviceDirection = direction;
+                    if (!worldToDevice.Equals(Transform.Identity))
+                    {
+                        Transform deviceToWorld = worldToDevice;
+                        if (deviceToWorld.TryGetInverse(out deviceToWorld))
+                        {
+                            deviceDirection.Transform(deviceToWorld);
+                        }
+                    }
+
+                    // Calculate force magnitude
                     double forceMagnitude = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
-                    currentForce = direction * forceMagnitude;
+
+                    // Calculate target point in device space for DeviceManager
+                    Point3d deviceTarget = devicePosition + deviceDirection * distance;
+                    var targetVector = new DeviceManager.Vector3D(
+                        deviceTarget.X,
+                        deviceTarget.Y,
+                        deviceTarget.Z
+                    );
+
+                    DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
                 }
+                else
+                {
+                    // When disabled or at target, update DeviceManager with current position
+                    var targetVector = new DeviceManager.Vector3D(
+                        devicePosition.X,
+                        devicePosition.Y,
+                        devicePosition.Z
+                    );
 
-                // Update target in DeviceManager for servo loop
-                var targetVector = new DeviceManager.Vector3D(
-                    transformedTarget.X,
-                    transformedTarget.Y,
-                    transformedTarget.Z
-                );
-
-                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
+                    DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
+                }
             }
             finally
             {

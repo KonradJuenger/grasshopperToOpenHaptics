@@ -2,6 +2,7 @@
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Buffers;
+using Rhino.Geometry;
 
 namespace ghoh
 {
@@ -22,12 +23,20 @@ namespace ghoh
         private static double maxDistanceValue = 1.0;
         private static long isRunningFlag; // 0 = false, 1 = true
 
+        // Plane constraint parameters
+        private static bool planeConstraintEnabled = false;
+        private static Point3d planeOrigin;
+        private static Vector3d planeNormal;
+        private static Transform worldToDevice = Transform.Identity;
+        private static readonly object planeConstraintLock = new object();
+
         // interpolation parameters
         private static Vector3D previousTarget;
         private static Vector3D currentInterpolatedTarget;
         private static DateTime lastTargetUpdateTime = DateTime.MinValue;
         private static bool interpolationEnabled = false;
-        private static double interpolationTimeWindow = 30.0; 
+        private static double interpolationTimeWindow = 30.0;
+
         // Struct to hold device state
         public struct DeviceState
         {
@@ -132,7 +141,6 @@ namespace ghoh
             try
             {
                 HDdll.hdBeginFrame(deviceHandle);
-                Logger.Log("ServoCallback - Frame started");
 
                 // Update current state
                 var position = arrayPool.Rent(3);
@@ -156,7 +164,6 @@ namespace ghoh
                 {
                     oldState = currentState;
                     currentState = newState;
-                    Logger.Log($"ServoCallback - Updated state: Pos({newState.Position[0]}, {newState.Position[1]}, {newState.Position[2]})");
                 }
 
                 if (oldState.Position != null) arrayPool.Return(oldState.Position);
@@ -166,7 +173,14 @@ namespace ghoh
                 // Calculate and apply forces if enabled
                 if (Interlocked.Read(ref forceEnabledFlag) == 1)
                 {
-                    CalculateAndApplyForce(position);
+                    if (planeConstraintEnabled)
+                    {
+                        CalculateAndApplyPlaneConstraintForce(position);
+                    }
+                    else
+                    {
+                        CalculateAndApplyForce(position);
+                    }
                 }
                 else
                 {
@@ -184,9 +198,71 @@ namespace ghoh
             }
         }
 
+        private static void CalculateAndApplyPlaneConstraintForce(double[] position)
+        {
+            // Convert device position to our coordinate system
+            var devicePos = new Vector3D(
+                -position[0],  // Negate X for coordinate system match
+                position[2],   // Z becomes Y
+                position[1]    // Y becomes Z
+            );
+
+            // Convert to world space
+            Point3d worldPos = new Point3d(devicePos.X, devicePos.Y, devicePos.Z);
+            Transform deviceToWorld;
+            lock (planeConstraintLock)
+            {
+                if (!worldToDevice.Equals(Transform.Identity))
+                {
+                    if (!worldToDevice.TryGetInverse(out deviceToWorld))
+                    {
+                        Logger.Log("[DeviceManager] Error: Could not invert transform");
+                        return;
+                    }
+                    worldPos.Transform(deviceToWorld);
+                }
+
+                // Project point onto plane
+                Point3d projectedPoint = new Point3d(worldPos);
+                Vector3d toPlane = projectedPoint - planeOrigin;
+                double dist = toPlane * planeNormal;
+                projectedPoint -= planeNormal * dist;
+
+                // Calculate distance and direction
+                Vector3d forceDir = projectedPoint - worldPos;
+                double distance = forceDir.Length;
+
+                if (distance < 0.001)
+                {
+                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
+                    return;
+                }
+
+                forceDir.Unitize();
+
+                // Transform direction back to device space
+                if (!worldToDevice.Equals(Transform.Identity))
+                {
+                    forceDir.Transform(worldToDevice);
+                }
+
+                // Calculate force magnitude
+                double scale = distance > maxDistanceValue ? maxForceValue : maxForceValue * (distance / maxDistanceValue);
+
+                // Apply force in device coordinates
+                var force = new double[]
+                {
+                    -forceDir.X * scale,  // Negate X for device space
+                    forceDir.Z * scale,   // Y becomes Z
+                    forceDir.Y * scale    // Z becomes Y
+                };
+
+                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+            }
+        }
+
         private static void CalculateAndApplyForce(double[] position)
         {
-
             // Get current target and parameters
             UpdateInterpolatedTarget();
             var target = currentInterpolatedTarget;
@@ -258,7 +334,7 @@ namespace ghoh
         public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD, bool useInterpolation, double interpolationWindow)
         {
             interpolationEnabled = useInterpolation;
-            interpolationTimeWindow = Math.Max(1.0, interpolationWindow); // Update interpolation window
+            interpolationTimeWindow = Math.Max(1.0, interpolationWindow);
             if (interpolationEnabled)
             {
                 previousTarget = currentInterpolatedTarget;
@@ -274,6 +350,7 @@ namespace ghoh
             maxForceValue = maxF;
             maxDistanceValue = maxD;
         }
+
         private static void UpdateInterpolatedTarget()
         {
             if (!interpolationEnabled || lastTargetUpdateTime == DateTime.MinValue)
@@ -283,7 +360,7 @@ namespace ghoh
             }
 
             double elapsedMs = (DateTime.Now - lastTargetUpdateTime).TotalMilliseconds;
-            double t = Math.Min(Math.Max(elapsedMs / 30.0, 0.0), 1.0); // 30ms interpolation window
+            double t = Math.Min(Math.Max(elapsedMs / interpolationTimeWindow, 0.0), 1.0);
 
             currentInterpolatedTarget = new Vector3D(
                 previousTarget.X + (targetPoint.X - previousTarget.X) * t,
@@ -293,6 +370,20 @@ namespace ghoh
 
             if (t >= 1.0) interpolationEnabled = false;
         }
+
+        public static void UpdatePlaneConstraint(Point3d origin, Vector3d normal, Transform transform, bool enable)
+        {
+            lock (planeConstraintLock)
+            {
+                planeConstraintEnabled = enable;
+                planeOrigin = origin;
+                planeNormal = normal;
+                planeNormal.Unitize();
+                worldToDevice = transform;
+            }
+            Logger.Log($"[DeviceManager] Updated plane constraint - Origin: ({(int)origin.X}, {(int)origin.Y}, {(int)origin.Z}), Normal: ({(int)normal.X}, {(int)normal.Y}, {(int)normal.Z})");
+        }
+
         public static void ApplyForce(double[] force, bool enable)
         {
             if (enable)

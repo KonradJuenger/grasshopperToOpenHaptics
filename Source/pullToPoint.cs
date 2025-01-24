@@ -1,4 +1,5 @@
-﻿using Grasshopper.Kernel;
+﻿// pullToPoint.cs
+using Grasshopper.Kernel;
 using Rhino.Geometry;
 using System;
 
@@ -83,24 +84,20 @@ namespace ghoh
                     state.Transform[13]      // Y becomes Z
                 );
 
-                // Transform target to device space if transform provided
-                Point3d transformedTarget = target;
+                // Transform device position to world space
+                Point3d transformedDevicePos = devicePosition;
                 if (!worldToDevice.Equals(Transform.Identity))
                 {
-                    Transform deviceToWorld = worldToDevice;
-                    if (deviceToWorld.TryGetInverse(out deviceToWorld))
-                    {
-                        transformedTarget.Transform(deviceToWorld);
-                    }
+                    transformedDevicePos.Transform(worldToDevice);
                 }
 
-                // Calculate direction and distance (both points in device space)
-                double distance = devicePosition.DistanceTo(transformedTarget);
+                // Calculate direction and distance in world space
+                double distance = transformedDevicePos.DistanceTo(target);
                 Vector3d currentForce = Vector3d.Zero;
 
                 if (enable && distance > 0.001)
                 {
-                    Vector3d direction = transformedTarget - devicePosition;
+                    Vector3d direction = target - transformedDevicePos;
                     direction.Unitize();
 
                     // Calculate force magnitude with smoothing at maxDistance
@@ -116,29 +113,59 @@ namespace ghoh
                         forceMagnitude = maxForce * (Math.Sin(t * Math.PI / 2));
                     }
 
+                    // Convert world space direction to device space for force
+                    Vector3d deviceDirection = direction;
+                    if (!worldToDevice.Equals(Transform.Identity))
+                    {
+                        Transform deviceToWorld = worldToDevice;
+                        if (deviceToWorld.TryGetInverse(out deviceToWorld))
+                        {
+                            deviceDirection.Transform(deviceToWorld);
+                        }
+                    }
+
                     // For display, convert device space direction to Rhino world space
                     currentForce = new Vector3d(
-                        direction.Y,    // Device X -> -Rhino X
-                        -direction.X,     // Device Z -> Rhino Y
-                        direction.Z      // Device Y -> Rhino Z
+                        deviceDirection.Y,    // Device X -> -Rhino X
+                        -deviceDirection.X,   // Device Z -> Rhino Y
+                        deviceDirection.Z     // Device Y -> Rhino Z
                     ) * forceMagnitude;
+
+                    // Calculate target point in device space for DeviceManager
+                    Point3d deviceTarget = devicePosition + deviceDirection * distance;
+                    var targetVector = new DeviceManager.Vector3D(
+                        deviceTarget.X,
+                        deviceTarget.Y,
+                        deviceTarget.Z
+                    );
+
+                    DeviceManager.UpdateTargetPoint(
+                        targetVector,
+                        enable,
+                        maxForce,
+                        maxDistance,
+                        interpolate,
+                        interpolationWindow
+                    );
                 }
+                else
+                {
+                    // When disabled or at target, update DeviceManager with current position
+                    var targetVector = new DeviceManager.Vector3D(
+                        devicePosition.X,
+                        devicePosition.Y,
+                        devicePosition.Z
+                    );
 
-                // Update target in DeviceManager for servo loop (stays in device space)
-                var targetVector = new DeviceManager.Vector3D(
-                    transformedTarget.X,
-                    transformedTarget.Y,
-                    transformedTarget.Z
-                );
-
-                DeviceManager.UpdateTargetPoint(
-                    targetVector,
-                    enable,
-                    maxForce,
-                    maxDistance,
-                    interpolate,
-                    interpolationWindow
-                );
+                    DeviceManager.UpdateTargetPoint(
+                        targetVector,
+                        enable,
+                        maxForce,
+                        maxDistance,
+                        interpolate,
+                        interpolationWindow
+                    );
+                }
 
                 // Update output only if enough time has passed
                 if (shouldUpdateOutput)
