@@ -6,7 +6,7 @@ namespace ghoh
     public static class Logger
     {
         private static readonly object lockObj = new object();
-        private static bool isLoggingEnabled = true;
+        private static bool isLoggingEnabled = false;
         private static string logFilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "ghoh_log.txt");
 
         public static void EnableLogging(bool enable)

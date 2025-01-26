@@ -14,8 +14,11 @@ namespace ghoh
 
         // Pull to point parameters
         private static DeviceManager.Vector3D targetPoint;
+        private static DeviceManager.Vector3D currentSmoothedTarget;
         private static double maxForceValuePoint = 1.0;
         private static double maxDistanceValuePoint = 1.0;
+        private static bool interpolationEnabled;
+        private static double maxStepSize = 5.0;  // Maximum distance to move per update
 
         // Pull to plane parameters
         private static DeviceManager.Vector3D planeOrigin;
@@ -36,13 +39,22 @@ namespace ghoh
             double maxForce,
             double maxDistance,
             bool useInterpolation = false,
-            double interpWindow = 30.0
+            double stepSize = 5.0
         )
         {
+            // Initialize smoothed target on first enable
+            if (!pullToPointEnabled && enable)
+            {
+                currentSmoothedTarget = target;
+            }
+
             pullToPointEnabled = enable;
             targetPoint = target;
             maxForceValuePoint = maxForce;
             maxDistanceValuePoint = maxDistance;
+            interpolationEnabled = useInterpolation;
+            maxStepSize = stepSize;
+
             UpdateForces();
         }
 
@@ -62,11 +74,49 @@ namespace ghoh
             UpdateForces();
         }
 
+        private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition)
+        {
+            if (!interpolationEnabled)
+            {
+                currentSmoothedTarget = targetPoint;
+                return;
+            }
+
+            // Calculate direction and distance to actual target
+            double dx = targetPoint.X - currentSmoothedTarget.X;
+            double dy = targetPoint.Y - currentSmoothedTarget.Y;
+            double dz = targetPoint.Z - currentSmoothedTarget.Z;
+
+            double distanceToTarget = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (distanceToTarget < 0.001)
+            {
+                return;  // Already close enough to target
+            }
+
+            // Calculate how far to move this update (distance-based)
+            double stepSize = Math.Min(distanceToTarget, maxStepSize);
+
+            // Update smoothed target position
+            double scale = stepSize / distanceToTarget;
+            currentSmoothedTarget = new DeviceManager.Vector3D(
+                currentSmoothedTarget.X + dx * scale,
+                currentSmoothedTarget.Y + dy * scale,
+                currentSmoothedTarget.Z + dz * scale
+            );
+        }
+
         public static void UpdateForces()
         {
             var totalForce = new double[3];
             var position = new double[3];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, position);
+
+            var devicePos = new DeviceManager.Vector3D(
+                -position[0],  // Negate X for coordinate system match
+                position[2],   // Z becomes Y
+                position[1]    // Y becomes Z
+            );
 
             // Apply direct force
             if (directForceEnabled)
@@ -78,6 +128,9 @@ namespace ghoh
             // Apply pull-to-point force
             if (pullToPointEnabled)
             {
+                // Update smoothed target before calculating forces
+                UpdateSmoothedTarget(devicePos);
+
                 var pointForce = CalculatePullToPointForce(position);
                 for (int i = 0; i < 3; i++)
                     totalForce[i] += pointForce[i];
@@ -103,10 +156,13 @@ namespace ghoh
                 position[1]    // Y becomes Z
             );
 
+            // Use smoothed target for force calculation
+            var targetToUse = interpolationEnabled ? currentSmoothedTarget : targetPoint;
+
             // Calculate direction and distance to target
-            var dx = targetPoint.X - devicePos.X;
-            var dy = targetPoint.Y - devicePos.Y;
-            var dz = targetPoint.Z - devicePos.Z;
+            var dx = targetToUse.X - devicePos.X;
+            var dy = targetToUse.Y - devicePos.Y;
+            var dz = targetToUse.Z - devicePos.Z;
 
             var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -116,7 +172,10 @@ namespace ghoh
             }
 
             // Normalize direction and calculate force magnitude
-            var scale = distance > maxDistanceValuePoint ? maxForceValuePoint : maxForceValuePoint * (distance / maxDistanceValuePoint);
+            var scale = distance > maxDistanceValuePoint ?
+                maxForceValuePoint :
+                maxForceValuePoint * (distance / maxDistanceValuePoint);
+
             var fx = (dx / distance) * scale;
             var fy = (dy / distance) * scale;
             var fz = (dz / distance) * scale;
@@ -177,6 +236,7 @@ namespace ghoh
             directForceEnabled = false;
             pullToPointEnabled = false;
             pullToPlaneEnabled = false;
+            interpolationEnabled = false;
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[3]);
         }
     }

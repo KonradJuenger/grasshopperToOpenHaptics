@@ -25,12 +25,13 @@ namespace ghoh
             pManager.AddNumberParameter("MaxForce", "F", "Maximum force to apply", GH_ParamAccess.item, 1.0);
             pManager.AddNumberParameter("MaxDistance", "D", "Distance at which force becomes constant", GH_ParamAccess.item, 1.0);
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
-            pManager.AddBooleanParameter("Interpolate", "I", "Enable target interpolation for smoother transitions", GH_ParamAccess.item, false);
-            pManager.AddNumberParameter("InterpolationWindow", "W", "Time window for interpolation (milliseconds)", GH_ParamAccess.item, 30.0);
+            pManager.AddBooleanParameter("UseSmoothing", "S", "Enable position smoothing for smoother transitions", GH_ParamAccess.item, false);
+            pManager.AddNumberParameter("MaxStep", "MS", "Maximum distance the smoothed target can move per update (larger = less smoothing)", GH_ParamAccess.item, 5.0);
             pManager.AddNumberParameter("UpdateInterval", "U", "Output update interval in milliseconds (10-5000)", GH_ParamAccess.item, 100.0);
 
             pManager[4].Optional = true;  // Transform
-            pManager[5].Optional = true;  // Interpolate
+            pManager[5].Optional = true;  // UseSmoothing
+            pManager[6].Optional = true;  // MaxStep
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -52,8 +53,8 @@ namespace ghoh
             double maxForce = 1.0;
             double maxDistance = 1.0;
             Transform worldToDevice = Transform.Identity;
-            bool interpolate = false;
-            double interpolationWindow = 30.0;
+            bool useSmoothing = false;
+            double maxStep = 5.0;
             double updateInterval = 100.0;
 
             if (!DA.GetData(0, ref enable)) return;
@@ -61,12 +62,15 @@ namespace ghoh
             if (!DA.GetData(2, ref maxForce)) return;
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
-            DA.GetData(5, ref interpolate);
-            DA.GetData(6, ref interpolationWindow);
+            DA.GetData(5, ref useSmoothing);
+            DA.GetData(6, ref maxStep);
             DA.GetData(7, ref updateInterval);
 
-            // Clamp update interval
+            // Validate and clamp parameters
             updateInterval = Math.Max(10.0, Math.Min(5000.0, updateInterval));
+            maxStep = Math.Max(0.1, maxStep);  // Ensure minimum step size
+            maxForce = Math.Max(0.0, maxForce);
+            maxDistance = Math.Max(0.001, maxDistance);
 
             // Check if enough time has passed to update output
             var currentTime = DateTime.Now;
@@ -100,8 +104,8 @@ namespace ghoh
                     enable,
                     maxForce,
                     maxDistance,
-                    interpolate,
-                    interpolationWindow
+                    useSmoothing,
+                    maxStep
                 );
 
                 // Calculate display force vector (for visualization)
@@ -119,7 +123,7 @@ namespace ghoh
                     {
                         Vector3d direction = transformedTarget - devicePosition;
                         direction.Unitize();
-                        double forceMagnitude = distance >= maxDistance ? maxForce : maxForce * (Math.Sin(distance / maxDistance * Math.PI / 2));
+                        double forceMagnitude = distance >= maxDistance ? maxForce : maxForce * (distance / maxDistance);
                         currentForce = direction * forceMagnitude;
                     }
                 }
