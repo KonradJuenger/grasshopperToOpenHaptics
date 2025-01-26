@@ -198,6 +198,9 @@ namespace ghoh
 
         private static double[] CalculatePlaneConstraintForce(double[] position)
         {
+            Logger.Log("=== BEGIN CalculatePlaneConstraintForce ===");
+            Logger.Log($"Raw device position: [{position[0]:F3}, {position[1]:F3}, {position[2]:F3}]");
+
             double[] force = new double[] { 0, 0, 0 };
 
             // Convert device position to our coordinate system
@@ -206,63 +209,88 @@ namespace ghoh
                 position[2],   // Z becomes Y
                 position[1]    // Y becomes Z
             );
+            Logger.Log($"Converted device position: X={devicePos.X:F3}, Y={devicePos.Y:F3}, Z={devicePos.Z:F3}");
 
             // Convert to world space
             Point3d worldPos = new Point3d(devicePos.X, devicePos.Y, devicePos.Z);
+            Logger.Log($"Initial world position: X={worldPos.X:F3}, Y={worldPos.Y:F3}, Z={worldPos.Z:F3}");
+
             Transform deviceToWorld;
             lock (planeConstraintLock)
             {
+                Logger.Log($"World to Device Transform: {worldToDevice}");
+
                 if (!worldToDevice.Equals(Transform.Identity))
                 {
                     if (!worldToDevice.TryGetInverse(out deviceToWorld))
                     {
+                        Logger.Log("ERROR: Could not invert transform");
                         return force;
                     }
+                    Logger.Log($"Device to World Transform: {deviceToWorld}");
                     worldPos.Transform(deviceToWorld);
+                    Logger.Log($"Transformed world position: X={worldPos.X:F3}, Y={worldPos.Y:F3}, Z={worldPos.Z:F3}");
                 }
+
+                Logger.Log($"Plane Origin: X={planeOrigin.X:F3}, Y={planeOrigin.Y:F3}, Z={planeOrigin.Z:F3}");
+                Logger.Log($"Plane Normal: X={planeNormal.X:F3}, Y={planeNormal.Y:F3}, Z={planeNormal.Z:F3}");
 
                 // Project point onto plane
                 Point3d projectedPoint = new Point3d(worldPos);
                 Vector3d toPlane = projectedPoint - planeOrigin;
                 double dist = toPlane * planeNormal;
+                Logger.Log($"Distance to plane: {dist:F3}");
+
                 projectedPoint -= planeNormal * dist;
+                Logger.Log($"Projected Point: X={projectedPoint.X:F3}, Y={projectedPoint.Y:F3}, Z={projectedPoint.Z:F3}");
 
                 // Calculate distance and direction
                 Vector3d forceDir = projectedPoint - worldPos;
                 double distance = forceDir.Length;
+                Logger.Log($"Distance for force calculation: {distance:F3}");
 
                 if (distance < 0.001)
                 {
+                    Logger.Log("Distance too small, returning zero force");
                     return force;
                 }
 
                 forceDir.Unitize();
+                Logger.Log($"Normalized Force Direction: X={forceDir.X:F3}, Y={forceDir.Y:F3}, Z={forceDir.Z:F3}");
 
                 // Transform direction back to device space
                 if (!worldToDevice.Equals(Transform.Identity))
                 {
                     forceDir.Transform(worldToDevice);
+                    forceDir.Unitize();
+                    Logger.Log($"Force Direction in Device Space: X={forceDir.X:F3}, Y={forceDir.Y:F3}, Z={forceDir.Z:F3}");
                 }
 
                 // Calculate force magnitude
                 double scale = distance > maxDistanceValue ? maxForceValue : maxForceValue * (distance / maxDistanceValue);
+                Logger.Log($"Force scale: {scale:F3} (maxForce={maxForceValue:F3}, maxDistance={maxDistanceValue:F3})");
 
                 // Convert to device coordinates
                 force[0] = -forceDir.X * scale;  // Negate X for device space
                 force[1] = forceDir.Z * scale;   // Y becomes Z
                 force[2] = forceDir.Y * scale;   // Z becomes Y
+
+                Logger.Log($"Final force vector: [{force[0]:F3}, {force[1]:F3}, {force[2]:F3}]");
             }
 
+            Logger.Log("=== END CalculatePlaneConstraintForce ===");
             return force;
         }
 
         private static void CalculateAndApplyForce(double[] position)
         {
+            Logger.Log("=== BEGIN CalculateAndApplyForce ===");
+            Logger.Log($"Raw device position: [{position[0]:F3}, {position[1]:F3}, {position[2]:F3}]");
+
             // Get current target and parameters
             UpdateInterpolatedTarget();
             var target = currentInterpolatedTarget;
-            var maxForce = maxForceValue;
-            var maxDistance = maxDistanceValue;
+            Logger.Log($"Target point: X={target.X:F3}, Y={target.Y:F3}, Z={target.Z:F3}");
 
             // Convert position to our coordinate system
             var devicePos = new Vector3D(
@@ -270,37 +298,45 @@ namespace ghoh
                 position[2],   // Z becomes Y
                 position[1]    // Y becomes Z
             );
+            Logger.Log($"Converted device position: X={devicePos.X:F3}, Y={devicePos.Y:F3}, Z={devicePos.Z:F3}");
 
             // Calculate direction and distance to target
             var dx = target.X - devicePos.X;
             var dy = target.Y - devicePos.Y;
             var dz = target.Z - devicePos.Z;
+            Logger.Log($"Direction vector: dx={dx:F3}, dy={dy:F3}, dz={dz:F3}");
 
             var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            Logger.Log($"Distance to target: {distance:F3}");
 
             if (distance < 0.001)
             {
+                Logger.Log("Distance too small, applying zero force");
                 HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
                 return;
             }
 
-            // Normalize direction
-            var scale = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
+            // Normalize direction and calculate force
+            var scale = distance > maxDistanceValue ? maxForceValue : maxForceValue * (distance / maxDistanceValue);
+            Logger.Log($"Force scale: {scale:F3} (maxForce={maxForceValue:F3}, maxDistance={maxDistanceValue:F3})");
+
             var fx = (dx / distance) * scale;
             var fy = (dy / distance) * scale;
             var fz = (dz / distance) * scale;
+            Logger.Log($"Scaled force components: fx={fx:F3}, fy={fy:F3}, fz={fz:F3}");
 
             // Convert back to device coordinates
             var force = new double[]
             {
-                -fx,  // Negate X for device space
-                fz,   // Y becomes Z
-                fy    // Z becomes Y
+        -fx,  // Negate X for device space
+        fz,   // Y becomes Z
+        fy    // Z becomes Y
             };
+            Logger.Log($"Final force vector: [{force[0]:F3}, {force[1]:F3}, {force[2]:F3}]");
 
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+            Logger.Log("=== END CalculateAndApplyForce ===");
         }
-
         public static DeviceState GetCurrentState()
         {
             if (deviceHandle == HDdll.HD_INVALID_HANDLE)
