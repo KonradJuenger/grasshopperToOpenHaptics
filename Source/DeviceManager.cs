@@ -37,6 +37,10 @@ namespace ghoh
         private static bool interpolationEnabled = false;
         private static double interpolationTimeWindow = 30.0;
 
+
+        private static bool directForceEnabled = false;
+        private static double[] directForce = new double[3];
+
         // Struct to hold device state
         public struct DeviceState
         {
@@ -151,44 +155,38 @@ namespace ghoh
                 HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
                 HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttons);
 
-                // Update cached state with proper synchronization
-                var newState = new DeviceState
-                {
-                    Position = position,
-                    Transform = transform,
-                    Buttons = (int)buttons[0]
-                };
+                // Calculate forces
+                double[] totalForce = new double[] { 0, 0, 0 };
 
-                DeviceState oldState;
-                lock (stateLock)
+                // Apply plane constraint force if enabled
+                if (Interlocked.Read(ref forceEnabledFlag) == 1 && planeConstraintEnabled)
                 {
-                    oldState = currentState;
-                    currentState = newState;
+                    var constraintForce = CalculatePlaneConstraintForce(position);
+                    totalForce[0] += constraintForce[0];
+                    totalForce[1] += constraintForce[1];
+                    totalForce[2] += constraintForce[2];
                 }
 
-                if (oldState.Position != null) arrayPool.Return(oldState.Position);
-                if (oldState.Transform != null) arrayPool.Return(oldState.Transform);
-                arrayPool.Return(buttons);
-
-                // Calculate and apply forces if enabled
-                if (Interlocked.Read(ref forceEnabledFlag) == 1)
+                // Add direct force if enabled
+                if (directForceEnabled)
                 {
-                    if (planeConstraintEnabled)
+                    lock (deviceLock)
                     {
-                        CalculateAndApplyPlaneConstraintForce(position);
-                    }
-                    else
-                    {
-                        CalculateAndApplyForce(position);
+                        totalForce[0] += directForce[0];
+                        totalForce[1] += directForce[1];
+                        totalForce[2] += directForce[2];
                     }
                 }
-                else
-                {
-                    var zeroForce = new double[] { 0, 0, 0 };
-                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, zeroForce);
-                }
+
+                // Apply combined force
+                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
 
                 HDdll.hdEndFrame(deviceHandle);
+
+                // Clean up
+                arrayPool.Return(position);
+                arrayPool.Return(transform);
+                arrayPool.Return(buttons);
 
                 return HDdll.HD_CALLBACK_CONTINUE;
             }
@@ -198,8 +196,10 @@ namespace ghoh
             }
         }
 
-        private static void CalculateAndApplyPlaneConstraintForce(double[] position)
+        private static double[] CalculatePlaneConstraintForce(double[] position)
         {
+            double[] force = new double[] { 0, 0, 0 };
+
             // Convert device position to our coordinate system
             var devicePos = new Vector3D(
                 -position[0],  // Negate X for coordinate system match
@@ -216,8 +216,7 @@ namespace ghoh
                 {
                     if (!worldToDevice.TryGetInverse(out deviceToWorld))
                     {
-                        Logger.Log("[DeviceManager] Error: Could not invert transform");
-                        return;
+                        return force;
                     }
                     worldPos.Transform(deviceToWorld);
                 }
@@ -234,8 +233,7 @@ namespace ghoh
 
                 if (distance < 0.001)
                 {
-                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
-                    return;
+                    return force;
                 }
 
                 forceDir.Unitize();
@@ -249,16 +247,13 @@ namespace ghoh
                 // Calculate force magnitude
                 double scale = distance > maxDistanceValue ? maxForceValue : maxForceValue * (distance / maxDistanceValue);
 
-                // Apply force in device coordinates
-                var force = new double[]
-                {
-                    -forceDir.X * scale,  // Negate X for device space
-                    forceDir.Z * scale,   // Y becomes Z
-                    forceDir.Y * scale    // Z becomes Y
-                };
-
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+                // Convert to device coordinates
+                force[0] = -forceDir.X * scale;  // Negate X for device space
+                force[1] = forceDir.Z * scale;   // Y becomes Z
+                force[2] = forceDir.Y * scale;   // Z becomes Y
             }
+
+            return force;
         }
 
         private static void CalculateAndApplyForce(double[] position)
@@ -386,15 +381,20 @@ namespace ghoh
 
         public static void ApplyForce(double[] force, bool enable)
         {
-            if (enable)
+            lock (deviceLock)
             {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
+                directForceEnabled = enable;
+                if (enable && force != null)
+                {
+                    if (directForce == null) directForce = new double[3];
+                    Array.Copy(force, directForce, 3);
+                }
+                else
+                {
+                    if (directForce != null)
+                        Array.Clear(directForce, 0, directForce.Length);
+                }
             }
-            else
-            {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
-            }
-            Interlocked.Exchange(ref forceEnabledFlag, enable ? 1 : 0);
         }
 
         public static void Deinitialize()
