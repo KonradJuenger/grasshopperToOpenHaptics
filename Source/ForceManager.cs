@@ -4,22 +4,24 @@ namespace ghoh
 {
     public static class ForceManager
     {
-        // Force types that can be enabled/disabled independently
+        // Flags for enabled forces
         private static bool directForceEnabled;
         private static bool pullToPointEnabled;
+        private static bool pullToPlaneEnabled;
 
         // Direct force parameters
-        private static double[] currentDirectForce = new double[] { 0, 0, 0 };
+        private static double[] currentDirectForce = new double[3];
 
         // Pull to point parameters
         private static DeviceManager.Vector3D targetPoint;
-        private static double maxForceValue = 1.0;
-        private static double maxDistanceValue = 1.0;
-        private static bool interpolationEnabled;
-        private static double interpolationTimeWindow = 30.0;
-        private static DeviceManager.Vector3D previousTarget;
-        private static DeviceManager.Vector3D currentInterpolatedTarget;
-        private static DateTime lastTargetUpdateTime = DateTime.MinValue;
+        private static double maxForceValuePoint = 1.0;
+        private static double maxDistanceValuePoint = 1.0;
+
+        // Pull to plane parameters
+        private static DeviceManager.Vector3D planeOrigin;
+        private static DeviceManager.Vector3D planeNormal;
+        private static double maxForceValuePlane = 1.0;
+        private static double maxDistanceValuePlane = 1.0;
 
         public static void SetDirectForce(double[] force, bool enable)
         {
@@ -28,71 +30,73 @@ namespace ghoh
             UpdateForces();
         }
 
-        public static void SetPullToPoint(DeviceManager.Vector3D target, bool enable, double maxForce,
-            double maxDistance, bool useInterpolation = false, double interpWindow = 30.0)
+        public static void SetPullToPoint(
+            DeviceManager.Vector3D target,
+            bool enable,
+            double maxForce,
+            double maxDistance,
+            bool useInterpolation = false,
+            double interpWindow = 30.0
+        )
         {
             pullToPointEnabled = enable;
-            interpolationEnabled = useInterpolation;
-            interpolationTimeWindow = Math.Max(1.0, interpWindow);
-
-            if (interpolationEnabled)
-            {
-                previousTarget = currentInterpolatedTarget;
-                lastTargetUpdateTime = DateTime.Now;
-            }
-            else
-            {
-                currentInterpolatedTarget = target;
-            }
-
             targetPoint = target;
-            maxForceValue = maxForce;
-            maxDistanceValue = maxDistance;
+            maxForceValuePoint = maxForce;
+            maxDistanceValuePoint = maxDistance;
+            UpdateForces();
+        }
 
+        public static void SetPullToPlane(
+            DeviceManager.Vector3D origin,
+            DeviceManager.Vector3D normal,
+            bool enable,
+            double maxForce,
+            double maxDistance
+        )
+        {
+            pullToPlaneEnabled = enable;
+            planeOrigin = origin;
+            planeNormal = normal;
+            maxForceValuePlane = maxForce;
+            maxDistanceValuePlane = maxDistance;
             UpdateForces();
         }
 
         public static void UpdateForces()
         {
-            if (!directForceEnabled && !pullToPointEnabled)
-            {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
-                return;
-            }
-
+            var totalForce = new double[3];
             var position = new double[3];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, position);
 
-            var totalForce = new double[] { 0, 0, 0 };
-
-            // Add direct force if enabled
+            // Apply direct force
             if (directForceEnabled)
             {
                 for (int i = 0; i < 3; i++)
-                {
                     totalForce[i] += currentDirectForce[i];
-                }
             }
 
-            // Add pull to point force if enabled
+            // Apply pull-to-point force
             if (pullToPointEnabled)
             {
-                var pullForce = CalculatePullForce(position);
+                var pointForce = CalculatePullToPointForce(position);
                 for (int i = 0; i < 3; i++)
-                {
-                    totalForce[i] += pullForce[i];
-                }
+                    totalForce[i] += pointForce[i];
             }
 
+            // Apply pull-to-plane force
+            if (pullToPlaneEnabled)
+            {
+                var planeForce = CalculatePullToPlaneForce(position);
+                for (int i = 0; i < 3; i++)
+                    totalForce[i] += planeForce[i];
+            }
+
+            // Set final force
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
         }
 
-        private static double[] CalculatePullForce(double[] position)
+        private static double[] CalculatePullToPointForce(double[] position)
         {
-            UpdateInterpolatedTarget();
-            var target = currentInterpolatedTarget;
-
-            // Convert position to our coordinate system
             var devicePos = new DeviceManager.Vector3D(
                 -position[0],  // Negate X for coordinate system match
                 position[2],   // Z becomes Y
@@ -100,9 +104,9 @@ namespace ghoh
             );
 
             // Calculate direction and distance to target
-            var dx = target.X - devicePos.X;
-            var dy = target.Y - devicePos.Y;
-            var dz = target.Z - devicePos.Z;
+            var dx = targetPoint.X - devicePos.X;
+            var dy = targetPoint.Y - devicePos.Y;
+            var dz = targetPoint.Z - devicePos.Z;
 
             var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -112,7 +116,7 @@ namespace ghoh
             }
 
             // Normalize direction and calculate force magnitude
-            var scale = distance > maxDistanceValue ? maxForceValue : maxForceValue * (distance / maxDistanceValue);
+            var scale = distance > maxDistanceValuePoint ? maxForceValuePoint : maxForceValuePoint * (distance / maxDistanceValuePoint);
             var fx = (dx / distance) * scale;
             var fy = (dy / distance) * scale;
             var fz = (dz / distance) * scale;
@@ -126,35 +130,54 @@ namespace ghoh
             };
         }
 
-        private static void UpdateInterpolatedTarget()
+        private static double[] CalculatePullToPlaneForce(double[] position)
         {
-            if (!interpolationEnabled || lastTargetUpdateTime == DateTime.MinValue)
-            {
-                currentInterpolatedTarget = targetPoint;
-                return;
-            }
-
-            double elapsedMs = (DateTime.Now - lastTargetUpdateTime).TotalMilliseconds;
-            double t = Math.Min(Math.Max(elapsedMs / interpolationTimeWindow, 0.0), 1.0);
-
-            currentInterpolatedTarget = new DeviceManager.Vector3D(
-                previousTarget.X + (targetPoint.X - previousTarget.X) * t,
-                previousTarget.Y + (targetPoint.Y - previousTarget.Y) * t,
-                previousTarget.Z + (targetPoint.Z - previousTarget.Z) * t
+            var devicePos = new DeviceManager.Vector3D(
+                -position[0],  // Negate X for coordinate system match
+                position[2],   // Z becomes Y
+                position[1]    // Y becomes Z
             );
 
-            if (t >= 1.0)
+            // Calculate vector from plane origin to device position
+            double dx = devicePos.X - planeOrigin.X;
+            double dy = devicePos.Y - planeOrigin.Y;
+            double dz = devicePos.Z - planeOrigin.Z;
+
+            // Compute signed distance to plane (dot product with normal)
+            double distance = dx * planeNormal.X + dy * planeNormal.Y + dz * planeNormal.Z;
+            double absDistance = Math.Abs(distance);
+
+            double forceMagnitude;
+            if (absDistance > maxDistanceValuePlane)
             {
-                interpolationEnabled = false;
+                forceMagnitude = maxForceValuePlane;
             }
+            else
+            {
+                forceMagnitude = (absDistance / maxDistanceValuePlane) * maxForceValuePlane;
+            }
+
+            // Determine direction towards the plane
+            double direction = distance > 0 ? -1 : 1;
+            double fx = planeNormal.X * direction * forceMagnitude;
+            double fy = planeNormal.Y * direction * forceMagnitude;
+            double fz = planeNormal.Z * direction * forceMagnitude;
+
+            // Convert back to device coordinates
+            return new double[]
+            {
+                -fx,  // Negate X for device space
+                fz,   // Y becomes Z
+                fy    // Z becomes Y
+            };
         }
 
         public static void Reset()
         {
             directForceEnabled = false;
             pullToPointEnabled = false;
-            currentDirectForce = new double[] { 0, 0, 0 };
-            HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, currentDirectForce);
+            pullToPlaneEnabled = false;
+            HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[3]);
         }
     }
 }
