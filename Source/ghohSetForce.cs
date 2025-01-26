@@ -70,8 +70,8 @@ namespace ghoh
 
             Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
 
-            // Apply the force to the device
-            DeviceManager.ApplyForce(forceArray, enable);
+            // Apply the force through ForceManager
+            ForceManager.SetDirectForce(forceArray, enable);
         }
 
         protected override System.Drawing.Bitmap Icon => null;

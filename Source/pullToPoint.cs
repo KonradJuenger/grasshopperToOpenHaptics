@@ -76,13 +76,6 @@ namespace ghoh
 
             try
             {
-                // Get device position in its native coordinate system
-                var devicePosition = new Point3d(
-                    -state.Transform[12],    // -X (negative to match coordinate system)
-                    state.Transform[14],     // Z becomes Y
-                    state.Transform[13]      // Y becomes Z
-                );
-
                 // Transform target to device space if transform provided
                 Point3d transformedTarget = target;
                 if (!worldToDevice.Equals(Transform.Identity))
@@ -94,44 +87,15 @@ namespace ghoh
                     }
                 }
 
-                // Calculate direction and distance (both points in device space)
-                double distance = devicePosition.DistanceTo(transformedTarget);
-                Vector3d currentForce = Vector3d.Zero;
-
-                if (enable && distance > 0.001)
-                {
-                    Vector3d direction = transformedTarget - devicePosition;
-                    direction.Unitize();
-
-                    // Calculate force magnitude with smoothing at maxDistance
-                    double forceMagnitude;
-                    if (distance >= maxDistance)
-                    {
-                        forceMagnitude = maxForce;
-                    }
-                    else
-                    {
-                        // Smooth transition near maxDistance using sine curve
-                        double t = distance / maxDistance;
-                        forceMagnitude = maxForce * (Math.Sin(t * Math.PI / 2));
-                    }
-
-                    // For display, convert device space direction to Rhino world space
-                    currentForce = new Vector3d(
-                        direction.Y,    // Device X -> -Rhino X
-                        -direction.X,     // Device Z -> Rhino Y
-                        direction.Z      // Device Y -> Rhino Z
-                    ) * forceMagnitude;
-                }
-
-                // Update target in DeviceManager for servo loop (stays in device space)
+                // Convert target to device space Vector3D
                 var targetVector = new DeviceManager.Vector3D(
                     transformedTarget.X,
                     transformedTarget.Y,
                     transformedTarget.Z
                 );
 
-                DeviceManager.UpdateTargetPoint(
+                // Update force through ForceManager
+                ForceManager.SetPullToPoint(
                     targetVector,
                     enable,
                     maxForce,
@@ -139,6 +103,26 @@ namespace ghoh
                     interpolate,
                     interpolationWindow
                 );
+
+                // Calculate display force vector (for visualization)
+                var devicePosition = new Point3d(
+                    -state.Transform[12],
+                    state.Transform[14],
+                    state.Transform[13]
+                );
+
+                Vector3d currentForce = Vector3d.Zero;
+                if (enable)
+                {
+                    double distance = devicePosition.DistanceTo(transformedTarget);
+                    if (distance > 0.001)
+                    {
+                        Vector3d direction = transformedTarget - devicePosition;
+                        direction.Unitize();
+                        double forceMagnitude = distance >= maxDistance ? maxForce : maxForce * (Math.Sin(distance / maxDistance * Math.PI / 2));
+                        currentForce = direction * forceMagnitude;
+                    }
+                }
 
                 // Update output only if enough time has passed
                 if (shouldUpdateOutput)

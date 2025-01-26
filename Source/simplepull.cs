@@ -52,53 +52,33 @@ namespace ghoh
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
 
-            var state = DeviceManager.GetCurrentState();
-
-            try
+            // Transform target to device space if transform provided
+            Point3d transformedTarget = target;
+            if (!worldToDevice.Equals(Transform.Identity))
             {
-                // Get device position in its native coordinate system
-                var devicePosition = new Point3d(
-                    -state.Transform[12],    // -X (negative to match coordinate system)
-                    state.Transform[14],     // Z becomes Y
-                    state.Transform[13]      // Y becomes Z
-                );
-
-                // Transform target to device space if transform provided
-                Point3d transformedTarget = target;
-                if (!worldToDevice.Equals(Transform.Identity))
+                Transform deviceToWorld = worldToDevice;
+                if (deviceToWorld.TryGetInverse(out deviceToWorld))
                 {
-                    Transform deviceToWorld = worldToDevice;
-                    if (deviceToWorld.TryGetInverse(out deviceToWorld))
-                    {
-                        transformedTarget.Transform(deviceToWorld);
-                    }
+                    transformedTarget.Transform(deviceToWorld);
                 }
-
-                // Calculate direction and distance (both points in device space)
-                double distance = devicePosition.DistanceTo(transformedTarget);
-                Vector3d currentForce = Vector3d.Zero;
-
-                if (enable && distance > 0.001)
-                {
-                    Vector3d direction = transformedTarget - devicePosition;
-                    direction.Unitize();
-                    double forceMagnitude = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
-                    currentForce = direction * forceMagnitude;
-                }
-
-                // Update target in DeviceManager for servo loop
-                var targetVector = new DeviceManager.Vector3D(
-                    transformedTarget.X,
-                    transformedTarget.Y,
-                    transformedTarget.Z
-                );
-
-                DeviceManager.UpdateTargetPoint(targetVector, enable, maxForce, maxDistance, false, 0);
             }
-            finally
-            {
-                state.ReturnArrays();
-            }
+
+            // Convert target to device space Vector3D
+            var targetVector = new DeviceManager.Vector3D(
+                transformedTarget.X,
+                transformedTarget.Y,
+                transformedTarget.Z
+            );
+
+            // Update force through ForceManager
+            ForceManager.SetPullToPoint(
+                targetVector,
+                enable,
+                maxForce,
+                maxDistance,
+                false,  // No interpolation in simple version
+                0.0     // No interpolation window needed
+            );
         }
 
         protected override System.Drawing.Bitmap Icon => null;

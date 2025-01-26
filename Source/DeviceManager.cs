@@ -11,24 +11,10 @@ namespace ghoh
         private static readonly object deviceLock = new object();
         private static readonly ArrayPool<double> arrayPool = ArrayPool<double>.Shared;
 
-        // Thread-safe state handling with proper synchronization
         private static DeviceState currentState;
         private static readonly object stateLock = new object();
-
-        // Force parameters with atomic operations
-        private static Vector3D targetPoint;
-        private static long forceEnabledFlag; // 0 = false, 1 = true
-        private static double maxForceValue = 1.0;
-        private static double maxDistanceValue = 1.0;
         private static long isRunningFlag; // 0 = false, 1 = true
 
-        // interpolation parameters
-        private static Vector3D previousTarget;
-        private static Vector3D currentInterpolatedTarget;
-        private static DateTime lastTargetUpdateTime = DateTime.MinValue;
-        private static bool interpolationEnabled = false;
-        private static double interpolationTimeWindow = 30.0; 
-        // Struct to hold device state
         public struct DeviceState
         {
             public double[] Position;
@@ -132,7 +118,6 @@ namespace ghoh
             try
             {
                 HDdll.hdBeginFrame(deviceHandle);
-                Logger.Log("ServoCallback - Frame started");
 
                 // Update current state
                 var position = arrayPool.Rent(3);
@@ -143,7 +128,7 @@ namespace ghoh
                 HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
                 HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttons);
 
-                // Update cached state with proper synchronization
+                // Update cached state
                 var newState = new DeviceState
                 {
                     Position = position,
@@ -156,23 +141,14 @@ namespace ghoh
                 {
                     oldState = currentState;
                     currentState = newState;
-                    Logger.Log($"ServoCallback - Updated state: Pos({newState.Position[0]}, {newState.Position[1]}, {newState.Position[2]})");
                 }
 
                 if (oldState.Position != null) arrayPool.Return(oldState.Position);
                 if (oldState.Transform != null) arrayPool.Return(oldState.Transform);
                 arrayPool.Return(buttons);
 
-                // Calculate and apply forces if enabled
-                if (Interlocked.Read(ref forceEnabledFlag) == 1)
-                {
-                    CalculateAndApplyForce(position);
-                }
-                else
-                {
-                    var zeroForce = new double[] { 0, 0, 0 };
-                    HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, zeroForce);
-                }
+                // Update forces through ForceManager
+                ForceManager.UpdateForces();
 
                 HDdll.hdEndFrame(deviceHandle);
 
@@ -182,52 +158,6 @@ namespace ghoh
             {
                 return HDdll.HD_CALLBACK_DONE;
             }
-        }
-
-        private static void CalculateAndApplyForce(double[] position)
-        {
-
-            // Get current target and parameters
-            UpdateInterpolatedTarget();
-            var target = currentInterpolatedTarget;
-            var maxForce = maxForceValue;
-            var maxDistance = maxDistanceValue;
-
-            // Convert position to our coordinate system
-            var devicePos = new Vector3D(
-                -position[0],  // Negate X for coordinate system match
-                position[2],   // Z becomes Y
-                position[1]    // Y becomes Z
-            );
-
-            // Calculate direction and distance to target
-            var dx = target.X - devicePos.X;
-            var dy = target.Y - devicePos.Y;
-            var dz = target.Z - devicePos.Z;
-
-            var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-
-            if (distance < 0.001)
-            {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
-                return;
-            }
-
-            // Normalize direction
-            var scale = distance > maxDistance ? maxForce : maxForce * (distance / maxDistance);
-            var fx = (dx / distance) * scale;
-            var fy = (dy / distance) * scale;
-            var fz = (dz / distance) * scale;
-
-            // Convert back to device coordinates
-            var force = new double[]
-            {
-                -fx,  // Negate X for device space
-                fz,   // Y becomes Z
-                fy    // Z becomes Y
-            };
-
-            HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
         }
 
         public static DeviceState GetCurrentState()
@@ -255,57 +185,6 @@ namespace ghoh
             }
         }
 
-        public static void UpdateTargetPoint(Vector3D target, bool enable, double maxF, double maxD, bool useInterpolation, double interpolationWindow)
-        {
-            interpolationEnabled = useInterpolation;
-            interpolationTimeWindow = Math.Max(1.0, interpolationWindow); // Update interpolation window
-            if (interpolationEnabled)
-            {
-                previousTarget = currentInterpolatedTarget;
-                lastTargetUpdateTime = DateTime.Now;
-            }
-            else
-            {
-                currentInterpolatedTarget = target;
-            }
-
-            targetPoint = target;
-            Interlocked.Exchange(ref forceEnabledFlag, enable ? 1 : 0);
-            maxForceValue = maxF;
-            maxDistanceValue = maxD;
-        }
-        private static void UpdateInterpolatedTarget()
-        {
-            if (!interpolationEnabled || lastTargetUpdateTime == DateTime.MinValue)
-            {
-                currentInterpolatedTarget = targetPoint;
-                return;
-            }
-
-            double elapsedMs = (DateTime.Now - lastTargetUpdateTime).TotalMilliseconds;
-            double t = Math.Min(Math.Max(elapsedMs / 30.0, 0.0), 1.0); // 30ms interpolation window
-
-            currentInterpolatedTarget = new Vector3D(
-                previousTarget.X + (targetPoint.X - previousTarget.X) * t,
-                previousTarget.Y + (targetPoint.Y - previousTarget.Y) * t,
-                previousTarget.Z + (targetPoint.Z - previousTarget.Z) * t
-            );
-
-            if (t >= 1.0) interpolationEnabled = false;
-        }
-        public static void ApplyForce(double[] force, bool enable)
-        {
-            if (enable)
-            {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, force);
-            }
-            else
-            {
-                HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[] { 0, 0, 0 });
-            }
-            Interlocked.Exchange(ref forceEnabledFlag, enable ? 1 : 0);
-        }
-
         public static void Deinitialize()
         {
             lock (deviceLock)
@@ -314,6 +193,7 @@ namespace ghoh
 
                 if (deviceHandle != HDdll.HD_INVALID_HANDLE)
                 {
+                    ForceManager.Reset();
                     HDdll.hdStopScheduler();
                     HDdll.hdDisableDevice(deviceHandle);
                     deviceHandle = HDdll.HD_INVALID_HANDLE;
