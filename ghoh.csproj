@@ -10,9 +10,15 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<!-- Grasshopper and Rhino dependencies -->
 		<PackageReference Include="Grasshopper" Version="8.0.23304.9001" ExcludeAssets="runtime" />
 		<PackageReference Include="RhinoCommon" Version="8.0.23304.9001" ExcludeAssets="runtime" />
 		<PackageReference Include="System.Drawing.Common" Version="8.0.0" ExcludeAssets="runtime" />
+
+		<!-- MathNet.Numerics for matrix operations in UKF -->
+		<PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+
+		<!-- Other dependencies -->
 		<PackageReference Include="System.Buffers" Version="4.5.1" />
 		<PackageReference Include="Microsoft.Extensions.ObjectPool" Version="8.0.0" />
 	</ItemGroup>

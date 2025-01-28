@@ -15,6 +15,9 @@ namespace ghoh
         private static readonly object stateLock = new object();
         private static long isRunningFlag; // 0 = false, 1 = true
 
+        private static UKF forceFilter; // UKF instance for force filtering
+        private static bool filterEnabled = true; // Flag to enable/disable filtering
+
         public struct DeviceState
         {
             public double[] Position;
@@ -147,19 +150,19 @@ namespace ghoh
                 if (oldState.Transform != null) arrayPool.Return(oldState.Transform);
                 arrayPool.Return(buttons);
 
-                // Update forces through ForceManager
-                ForceManager.UpdateForces();
+                // Update forces through ForceManager or filtered forces
+                ghohSetForce.UpdateServoForces();
 
                 HDdll.hdEndFrame(deviceHandle);
 
                 return HDdll.HD_CALLBACK_CONTINUE;
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Log($"Error in servo loop: {ex.Message}");
                 return HDdll.HD_CALLBACK_DONE;
             }
         }
-
         public static DeviceState GetCurrentState()
         {
             if (deviceHandle == HDdll.HD_INVALID_HANDLE)

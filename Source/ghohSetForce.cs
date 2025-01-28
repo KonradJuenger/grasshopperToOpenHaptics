@@ -1,12 +1,24 @@
 ﻿using Grasshopper.Kernel;
 using Rhino.Geometry;
 using System;
+using MathNet.Numerics.LinearAlgebra;
 
 namespace ghoh
 {
     public class ghohSetForce : GH_Component
     {
-        public ghohSetForce() : base("ghohSetForce", "SetForce", "Sets force to the haptic device", "ghoh", "device")
+        // UKF instance and state
+        private static UKF forceFilter;
+        private static Vector3d lastRawForce = Vector3d.Zero;
+        private static bool filterEnabled = true;
+        private const double MAX_FORCE = 10.0;  // Maximum force in Newtons
+
+        public ghohSetForce() : base(
+            "ghohSetForce",
+            "SetForce",
+            "Sets force to the haptic device with Kalman filtering",
+            "ghoh",
+            "device")
         {
         }
 
@@ -14,64 +26,157 @@ namespace ghoh
         {
             pManager.AddBooleanParameter("Enable", "E", "Enable or disable force application", GH_ParamAccess.item, false);
             pManager.AddVectorParameter("Force", "F", "Force vector to apply to the device", GH_ParamAccess.item, new Vector3d(0, 0, 0));
-            pManager.AddTransformParameter("Transform", "X", "Optional transform matrix for scaling and additional transformations", GH_ParamAccess.item);
-            pManager[2].Optional = true;
+            pManager.AddTransformParameter("Transform", "X", "Optional transform matrix", GH_ParamAccess.item);
+            pManager.AddBooleanParameter("FilterEnabled", "Filt", "Enable Kalman filtering", GH_ParamAccess.item, true);
+            pManager.AddNumberParameter("ProcessNoise", "Q", "Process noise covariance (0.001-1.0)", GH_ParamAccess.item, 0.05);
+            pManager.AddNumberParameter("MeasNoise", "R", "Measurement noise covariance (0.001-1.0)", GH_ParamAccess.item, 0.3);
+
+            pManager[2].Optional = true;  // Transform
+            pManager[3].Optional = true;  // FilterEnabled
+            pManager[4].Optional = true;  // ProcessNoise
+            pManager[5].Optional = true;  // MeasNoise
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
-            // No output parameters needed
+            pManager.AddVectorParameter("FilteredForce", "FF", "Current filtered force vector", GH_ParamAccess.item);
+            pManager.AddNumberParameter("FilterQuality", "FQ", "Filter quality metric (0-1)", GH_ParamAccess.item);
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            Logger.Log("ghohSetForce - SolveInstance started");
-
             bool enable = false;
             Vector3d force = new Vector3d();
-            Transform additionalTransform = Transform.Identity;
+            Transform transform = Transform.Identity;
+            double q = 0.05, r = 0.3;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref force)) return;
-            DA.GetData(2, ref additionalTransform);
+            DA.GetData(2, ref transform);
+            DA.GetData(3, ref filterEnabled);
+            DA.GetData(4, ref q);
+            DA.GetData(5, ref r);
 
-            Logger.Log($"ghohSetForce - Retrieved force: {force.X},{force.Y},{force.Z}");
-            Logger.Log($"ghohSetForce - Retrieved enable: {enable}");
+            // Clamp noise parameters to valid range
+            q = Math.Max(0.001, Math.Min(q, 1.0));
+            r = Math.Max(0.001, Math.Min(r, 1.0));
 
-            int handle = DeviceManager.DeviceHandle;
-            Logger.Log($"ghohSetForce - Device handle: {handle}");
-
-            if (handle == HDdll.HD_INVALID_HANDLE)
+            // Apply transform if provided
+            if (!transform.Equals(Transform.Identity))
             {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized.");
-                Logger.Log("ghohSetForce - Device not initialized.");
-                return;
+                Transform inverseTransform = transform;
+                if (inverseTransform.TryGetInverse(out inverseTransform))
+                {
+                    force.Transform(inverseTransform);
+                }
             }
 
-            // Apply any additional transformation if provided
-            if (!additionalTransform.Equals(Transform.Identity))
+            // Clamp force magnitude for safety
+            force = ClampForce(force);
+
+            // Initialize or update UKF
+            if (forceFilter == null)
             {
-                Transform inverseTransform = additionalTransform;
-                inverseTransform.TryGetInverse(out inverseTransform);
-                force.Transform(inverseTransform);
+                forceFilter = new UKF(3);
+                forceFilter.SetNoiseParams(q, r);
+            }
+            else if (enable && filterEnabled)
+            {
+                forceFilter.SetNoiseParams(q, r);
             }
 
-            // Remap the force vector components according to the required transformation:
-            // Rhino -> Device
-            // X -> -X (negative to match coordinate system)
-            // Y -> Z
-            // Z -> Y
-            double[] forceArray = new double[3]
+            // Store raw force for servo loop updates
+            lastRawForce = force;
+
+            // Update filter with new measurement if enabled
+            if (enable && filterEnabled)
             {
-                -force.X,    // -X
-                force.Z,     // Y
-                force.Y      // Z
-            };
+                var measurement = new[] { force.X, force.Y, force.Z };
+                forceFilter.Update(measurement);
 
-            Logger.Log($"ghohSetForce - Applying force: [{forceArray[0]}, {forceArray[1]}, {forceArray[2]}], Enable: {enable}");
+                // Get filtered force for output
+                var filteredState = forceFilter.getState();
+                var filteredForce = new Vector3d(filteredState[0], filteredState[1], filteredState[2]);
 
-            // Apply the force through ForceManager
-            ForceManager.SetDirectForce(forceArray, enable);
+                // Calculate filter quality metric (based on covariance trace)
+                var covariance = forceFilter.getCovariance();
+                double quality = CalculateFilterQuality(covariance);
+
+                // Set outputs
+                DA.SetData(0, filteredForce);
+                DA.SetData(1, quality);
+            }
+            else
+            {
+                // If filter disabled, output raw force
+                DA.SetData(0, force);
+                DA.SetData(1, 1.0); // Perfect quality when not filtering
+
+                if (forceFilter != null)
+                {
+                    forceFilter.Reset();
+                }
+
+                // Apply force directly if enabled but not filtering
+                if (enable)
+                {
+                    double[] forceArray = new double[3]
+                    {
+                        -force.X,
+                        force.Z,
+                        force.Y
+                    };
+                    ForceManager.SetDirectForce(forceArray, true);
+                }
+            }
+        }
+
+        private Vector3d ClampForce(Vector3d force)
+        {
+            double magnitude = force.Length;
+            if (magnitude > MAX_FORCE)
+            {
+                force *= MAX_FORCE / magnitude;
+            }
+            return force;
+        }
+
+        private double CalculateFilterQuality(double[,] covariance)
+        {
+            // Calculate normalized trace of covariance matrix
+            double trace = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                trace += covariance[i, i];
+            }
+            // Convert to quality metric (0-1, higher is better)
+            return 1.0 / (1.0 + trace);
+        }
+
+        public static void UpdateServoForces()
+        {
+            if (forceFilter == null || !filterEnabled) return;
+
+            try
+            {
+                // Get filtered force prediction
+                forceFilter.Predict();
+                var filteredForce = forceFilter.getState();
+
+                // Apply coordinate transformation and send to device
+                double[] forceArray = new double[3]
+                {
+                    -filteredForce[0],  // Negate X for device space
+                    filteredForce[2],   // Y becomes Z
+                    filteredForce[1]    // Z becomes Y
+                };
+
+                ForceManager.SetDirectForce(forceArray, true);
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"Error in UpdateServoForces: {ex.Message}");
+            }
         }
 
         protected override System.Drawing.Bitmap Icon => null;
