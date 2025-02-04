@@ -22,8 +22,10 @@ namespace ghoh
             pManager.AddNumberParameter("MaxForce", "F", "Maximum force to apply", GH_ParamAccess.item, 1.0);
             pManager.AddNumberParameter("MaxDistance", "D", "Distance at which force becomes constant", GH_ParamAccess.item, 1.0);
             pManager.AddTransformParameter("Transform", "X", "Transform matrix for world to device space", GH_ParamAccess.item);
+            pManager.AddVectorParameter("TCPOffset", "O", "Optional offset vector from TCP in device coordinates", GH_ParamAccess.item, Vector3d.Zero);
 
             pManager[4].Optional = true;  // Transform
+            pManager[5].Optional = true;  // TCPOffset
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -45,12 +47,14 @@ namespace ghoh
             double maxForce = 1.0;
             double maxDistance = 1.0;
             Transform worldToDevice = Transform.Identity;
+            Vector3d tcpOffset = Vector3d.Zero;
 
             if (!DA.GetData(0, ref enable)) return;
             if (!DA.GetData(1, ref targetPlane)) return;
             if (!DA.GetData(2, ref maxForce)) return;
             if (!DA.GetData(3, ref maxDistance)) return;
             DA.GetData(4, ref worldToDevice);
+            DA.GetData(5, ref tcpOffset);
 
             // Transform target plane to device space if transform provided
             if (!worldToDevice.Equals(Transform.Identity))
@@ -77,7 +81,15 @@ namespace ghoh
                 targetPlane.Normal.Z
             );
 
-            // Update force through ForceManager
+            // Set TCP offset first
+            var offsetVector = new DeviceManager.Vector3D(
+                tcpOffset.X,
+                tcpOffset.Y,
+                tcpOffset.Z
+            );
+            ForceManager.SetTCPOffset(offsetVector);
+
+            // Then set the plane parameters
             ForceManager.SetPullToPlane(
                 origin,
                 normal,

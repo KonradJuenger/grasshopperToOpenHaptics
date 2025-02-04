@@ -19,6 +19,9 @@ namespace ghoh
         private static double processNoise = 0.05;
         private static double measurementNoise = 0.3;
 
+        // TCP Offset
+        private static DeviceManager.Vector3D tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
+
         // Pull to point parameters
         private static DeviceManager.Vector3D targetPoint;
         private static DeviceManager.Vector3D currentSmoothedTarget;
@@ -32,6 +35,12 @@ namespace ghoh
         private static DeviceManager.Vector3D planeNormal;
         private static double maxForceValuePlane = 1.0;
         private static double maxDistanceValuePlane = 1.0;
+
+        public static void SetTCPOffset(DeviceManager.Vector3D offset)
+        {
+            tcpOffset = offset;
+            UpdateForces();
+        }
 
         public static void SetDirectForce(double[] force, bool enable, bool useFilter = false)
         {
@@ -62,6 +71,8 @@ namespace ghoh
                 directForceEnabled = enable;
                 filteredForceEnabled = false;  // Disable filtered force
             }
+
+            //UpdateForces();
         }
 
         public static void SetFilterParams(double q, double r)
@@ -95,6 +106,8 @@ namespace ghoh
             maxDistanceValuePoint = maxDistance;
             interpolationEnabled = useInterpolation;
             maxStepSize = stepSize;
+
+            UpdateForces();
         }
 
         public static void SetPullToPlane(
@@ -110,6 +123,8 @@ namespace ghoh
             planeNormal = normal;
             maxForceValuePlane = maxForce;
             maxDistanceValuePlane = maxDistance;
+
+            UpdateForces();
         }
 
         private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition)
@@ -147,16 +162,61 @@ namespace ghoh
         public static void UpdateForces()
         {
             var totalForce = new double[3];
-            var position = new double[3];
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_POSITION, position);
+            var transform = new double[16];
+            HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
 
-            var devicePos = new DeviceManager.Vector3D(
-                -position[0],  // Negate X for coordinate system match
-                position[2],   // Z becomes Y
-                position[1]    // Y becomes Z
+            // Get device orientation vectors for TCP offset
+            var xDirection = new DeviceManager.Vector3D(
+                -transform[0],
+                transform[2],
+                transform[1]
             );
 
-            // Apply direct force (either filtered or unfiltered)
+            var yDirection = new DeviceManager.Vector3D(
+                -transform[4],
+                transform[6],
+                transform[5]
+            );
+
+            // Get zDirection via cross product
+            var zDirection = new DeviceManager.Vector3D(
+                xDirection.Y * yDirection.Z - xDirection.Z * yDirection.Y,
+                xDirection.Z * yDirection.X - xDirection.X * yDirection.Z,
+                xDirection.X * yDirection.Y - xDirection.Y * yDirection.X
+            );
+
+            // Base device position
+            var devicePos = new DeviceManager.Vector3D(
+                -transform[12],
+                transform[14],
+                transform[13]
+            );
+
+            // Apply TCP offset in device's coordinate system for position-based forces
+            if (tcpOffset.X != 0 || tcpOffset.Y != 0 || tcpOffset.Z != 0)
+            {
+                devicePos.X += tcpOffset.X * xDirection.X + tcpOffset.Y * yDirection.X + tcpOffset.Z * zDirection.X;
+                devicePos.Y += tcpOffset.X * xDirection.Y + tcpOffset.Y * yDirection.Y + tcpOffset.Z * zDirection.Y;
+                devicePos.Z += tcpOffset.X * xDirection.Z + tcpOffset.Y * yDirection.Z + tcpOffset.Z * zDirection.Z;
+            }
+
+            // Calculate and apply position-based forces
+            if (pullToPointEnabled)
+            {
+                UpdateSmoothedTarget(devicePos);
+                var pointForce = CalculatePullToPointForce(devicePos);
+                for (int i = 0; i < 3; i++)
+                    totalForce[i] += pointForce[i];
+            }
+
+            if (pullToPlaneEnabled)
+            {
+                var planeForce = CalculatePullToPlaneForce(devicePos);
+                for (int i = 0; i < 3; i++)
+                    totalForce[i] += planeForce[i];
+            }
+
+            // Add direct forces (filtered or unfiltered) without transformation
             if (filteredForceEnabled && forceFilter != null)
             {
                 forceFilter.Predict();
@@ -170,35 +230,12 @@ namespace ghoh
                     totalForce[i] += currentDirectForce[i];
             }
 
-            // Apply pull-to-point force
-            if (pullToPointEnabled)
-            {
-                UpdateSmoothedTarget(devicePos);
-                var pointForce = CalculatePullToPointForce(position);
-                for (int i = 0; i < 3; i++)
-                    totalForce[i] += pointForce[i];
-            }
-
-            // Apply pull-to-plane force
-            if (pullToPlaneEnabled)
-            {
-                var planeForce = CalculatePullToPlaneForce(position);
-                for (int i = 0; i < 3; i++)
-                    totalForce[i] += planeForce[i];
-            }
-
             // Set final force
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
         }
 
-        private static double[] CalculatePullToPointForce(double[] position)
+        private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos)
         {
-            var devicePos = new DeviceManager.Vector3D(
-                -position[0],  // Negate X for coordinate system match
-                position[2],   // Z becomes Y
-                position[1]    // Y becomes Z
-            );
-
             // Use smoothed target for force calculation
             var targetToUse = interpolationEnabled ? currentSmoothedTarget : targetPoint;
 
@@ -232,14 +269,8 @@ namespace ghoh
             };
         }
 
-        private static double[] CalculatePullToPlaneForce(double[] position)
+        private static double[] CalculatePullToPlaneForce(DeviceManager.Vector3D devicePos)
         {
-            var devicePos = new DeviceManager.Vector3D(
-                -position[0],  // Negate X for coordinate system match
-                position[2],   // Z becomes Y
-                position[1]    // Y becomes Z
-            );
-
             // Calculate vector from plane origin to device position
             double dx = devicePos.X - planeOrigin.X;
             double dy = devicePos.Y - planeOrigin.Y;
@@ -281,6 +312,7 @@ namespace ghoh
             pullToPlaneEnabled = false;
             filteredForceEnabled = false;
             interpolationEnabled = false;
+            tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
             if (forceFilter != null)
             {
                 forceFilter.Reset();
