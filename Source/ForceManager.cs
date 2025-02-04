@@ -39,7 +39,6 @@ namespace ghoh
         public static void SetTCPOffset(DeviceManager.Vector3D offset)
         {
             tcpOffset = offset;
-            UpdateForces();
         }
 
         public static void SetDirectForce(double[] force, bool enable, bool useFilter = false)
@@ -72,7 +71,7 @@ namespace ghoh
                 filteredForceEnabled = false;  // Disable filtered force
             }
 
-            //UpdateForces();
+            UpdateForces();
         }
 
         public static void SetFilterParams(double q, double r)
@@ -94,7 +93,6 @@ namespace ghoh
             double stepSize = 5.0
         )
         {
-            // Initialize smoothed target on first enable
             if (!pullToPointEnabled && enable)
             {
                 currentSmoothedTarget = target;
@@ -106,8 +104,6 @@ namespace ghoh
             maxDistanceValuePoint = maxDistance;
             interpolationEnabled = useInterpolation;
             maxStepSize = stepSize;
-
-            UpdateForces();
         }
 
         public static void SetPullToPlane(
@@ -123,8 +119,6 @@ namespace ghoh
             planeNormal = normal;
             maxForceValuePlane = maxForce;
             maxDistanceValuePlane = maxDistance;
-
-            UpdateForces();
         }
 
         private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition)
@@ -135,7 +129,6 @@ namespace ghoh
                 return;
             }
 
-            // Calculate direction and distance to actual target
             double dx = targetPoint.X - currentSmoothedTarget.X;
             double dy = targetPoint.Y - currentSmoothedTarget.Y;
             double dz = targetPoint.Z - currentSmoothedTarget.Z;
@@ -144,13 +137,10 @@ namespace ghoh
 
             if (distanceToTarget < 0.001)
             {
-                return;  // Already close enough to target
+                return;
             }
 
-            // Calculate how far to move this update (distance-based)
             double stepSize = Math.Min(distanceToTarget, maxStepSize);
-
-            // Update smoothed target position
             double scale = stepSize / distanceToTarget;
             currentSmoothedTarget = new DeviceManager.Vector3D(
                 currentSmoothedTarget.X + dx * scale,
@@ -165,7 +155,6 @@ namespace ghoh
             var transform = new double[16];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
 
-            // Get device orientation vectors for TCP offset
             var xDirection = new DeviceManager.Vector3D(
                 -transform[0],
                 transform[2],
@@ -178,21 +167,18 @@ namespace ghoh
                 transform[5]
             );
 
-            // Get zDirection via cross product
             var zDirection = new DeviceManager.Vector3D(
                 xDirection.Y * yDirection.Z - xDirection.Z * yDirection.Y,
                 xDirection.Z * yDirection.X - xDirection.X * yDirection.Z,
                 xDirection.X * yDirection.Y - xDirection.Y * yDirection.X
             );
 
-            // Base device position
             var devicePos = new DeviceManager.Vector3D(
                 -transform[12],
                 transform[14],
                 transform[13]
             );
 
-            // Apply TCP offset in device's coordinate system for position-based forces
             if (tcpOffset.X != 0 || tcpOffset.Y != 0 || tcpOffset.Z != 0)
             {
                 devicePos.X += tcpOffset.X * xDirection.X + tcpOffset.Y * yDirection.X + tcpOffset.Z * zDirection.X;
@@ -200,7 +186,6 @@ namespace ghoh
                 devicePos.Z += tcpOffset.X * xDirection.Z + tcpOffset.Y * yDirection.Z + tcpOffset.Z * zDirection.Z;
             }
 
-            // Calculate and apply position-based forces
             if (pullToPointEnabled)
             {
                 UpdateSmoothedTarget(devicePos);
@@ -216,7 +201,6 @@ namespace ghoh
                     totalForce[i] += planeForce[i];
             }
 
-            // Add direct forces (filtered or unfiltered) without transformation
             if (filteredForceEnabled && forceFilter != null)
             {
                 forceFilter.Predict();
@@ -230,16 +214,13 @@ namespace ghoh
                     totalForce[i] += currentDirectForce[i];
             }
 
-            // Set final force
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
         }
 
         private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos)
         {
-            // Use smoothed target for force calculation
             var targetToUse = interpolationEnabled ? currentSmoothedTarget : targetPoint;
 
-            // Calculate direction and distance to target
             var dx = targetToUse.X - devicePos.X;
             var dy = targetToUse.Y - devicePos.Y;
             var dz = targetToUse.Z - devicePos.Z;
@@ -251,7 +232,6 @@ namespace ghoh
                 return new double[] { 0, 0, 0 };
             }
 
-            // Normalize direction and calculate force magnitude
             var scale = distance > maxDistanceValuePoint ?
                 maxForceValuePoint :
                 maxForceValuePoint * (distance / maxDistanceValuePoint);
@@ -260,23 +240,20 @@ namespace ghoh
             var fy = (dy / distance) * scale;
             var fz = (dz / distance) * scale;
 
-            // Convert back to device coordinates
             return new double[]
             {
-                -fx,  // Negate X for device space
-                fz,   // Y becomes Z
-                fy    // Z becomes Y
+                -fx,
+                fz,
+                fy
             };
         }
 
         private static double[] CalculatePullToPlaneForce(DeviceManager.Vector3D devicePos)
         {
-            // Calculate vector from plane origin to device position
             double dx = devicePos.X - planeOrigin.X;
             double dy = devicePos.Y - planeOrigin.Y;
             double dz = devicePos.Z - planeOrigin.Z;
 
-            // Compute signed distance to plane (dot product with normal)
             double distance = dx * planeNormal.X + dy * planeNormal.Y + dz * planeNormal.Z;
             double absDistance = Math.Abs(distance);
 
@@ -290,18 +267,16 @@ namespace ghoh
                 forceMagnitude = (absDistance / maxDistanceValuePlane) * maxForceValuePlane;
             }
 
-            // Determine direction towards the plane
             double direction = distance > 0 ? -1 : 1;
             double fx = planeNormal.X * direction * forceMagnitude;
             double fy = planeNormal.Y * direction * forceMagnitude;
             double fz = planeNormal.Z * direction * forceMagnitude;
 
-            // Convert back to device coordinates
             return new double[]
             {
-                -fx,  // Negate X for device space
-                fz,   // Y becomes Z
-                fy    // Z becomes Y
+                -fx,
+                fz,
+                fy
             };
         }
 
