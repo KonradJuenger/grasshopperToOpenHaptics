@@ -8,9 +8,16 @@ namespace ghoh
         private static bool directForceEnabled;
         private static bool pullToPointEnabled;
         private static bool pullToPlaneEnabled;
+        private static bool filteredForceEnabled;
 
         // Direct force parameters
         private static double[] currentDirectForce = new double[3];
+
+        // Filtered force support
+        private static UKF forceFilter;
+        private static double[] lastFilteredForce = new double[3];
+        private static double processNoise = 0.05;
+        private static double measurementNoise = 0.3;
 
         // Pull to point parameters
         private static DeviceManager.Vector3D targetPoint;
@@ -26,11 +33,45 @@ namespace ghoh
         private static double maxForceValuePlane = 1.0;
         private static double maxDistanceValuePlane = 1.0;
 
-        public static void SetDirectForce(double[] force, bool enable)
+        public static void SetDirectForce(double[] force, bool enable, bool useFilter = false)
         {
-            currentDirectForce = force;
-            directForceEnabled = enable;
-            UpdateForces();
+            if (useFilter)
+            {
+                if (forceFilter == null)
+                {
+                    forceFilter = new UKF(3);
+                    forceFilter.SetNoiseParams(processNoise, measurementNoise);
+                }
+
+                if (enable)
+                {
+                    forceFilter.Update(force);
+                    lastFilteredForce = forceFilter.getState();
+                }
+                else
+                {
+                    forceFilter.Reset();
+                }
+
+                filteredForceEnabled = enable;
+                directForceEnabled = false;  // Disable unfiltered direct force
+            }
+            else
+            {
+                currentDirectForce = force;
+                directForceEnabled = enable;
+                filteredForceEnabled = false;  // Disable filtered force
+            }
+        }
+
+        public static void SetFilterParams(double q, double r)
+        {
+            processNoise = Math.Max(0.001, Math.Min(q, 1.0));
+            measurementNoise = Math.Max(0.001, Math.Min(r, 1.0));
+            if (forceFilter != null)
+            {
+                forceFilter.SetNoiseParams(processNoise, measurementNoise);
+            }
         }
 
         public static void SetPullToPoint(
@@ -54,8 +95,6 @@ namespace ghoh
             maxDistanceValuePoint = maxDistance;
             interpolationEnabled = useInterpolation;
             maxStepSize = stepSize;
-
-            UpdateForces();
         }
 
         public static void SetPullToPlane(
@@ -71,7 +110,6 @@ namespace ghoh
             planeNormal = normal;
             maxForceValuePlane = maxForce;
             maxDistanceValuePlane = maxDistance;
-            UpdateForces();
         }
 
         private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition)
@@ -118,8 +156,15 @@ namespace ghoh
                 position[1]    // Y becomes Z
             );
 
-            // Apply direct force
-            if (directForceEnabled)
+            // Apply direct force (either filtered or unfiltered)
+            if (filteredForceEnabled && forceFilter != null)
+            {
+                forceFilter.Predict();
+                lastFilteredForce = forceFilter.getState();
+                for (int i = 0; i < 3; i++)
+                    totalForce[i] += lastFilteredForce[i];
+            }
+            else if (directForceEnabled)
             {
                 for (int i = 0; i < 3; i++)
                     totalForce[i] += currentDirectForce[i];
@@ -128,9 +173,7 @@ namespace ghoh
             // Apply pull-to-point force
             if (pullToPointEnabled)
             {
-                // Update smoothed target before calculating forces
                 UpdateSmoothedTarget(devicePos);
-
                 var pointForce = CalculatePullToPointForce(position);
                 for (int i = 0; i < 3; i++)
                     totalForce[i] += pointForce[i];
@@ -236,7 +279,12 @@ namespace ghoh
             directForceEnabled = false;
             pullToPointEnabled = false;
             pullToPlaneEnabled = false;
+            filteredForceEnabled = false;
             interpolationEnabled = false;
+            if (forceFilter != null)
+            {
+                forceFilter.Reset();
+            }
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[3]);
         }
     }

@@ -150,8 +150,8 @@ namespace ghoh
                 if (oldState.Transform != null) arrayPool.Return(oldState.Transform);
                 arrayPool.Return(buttons);
 
-                // Update forces through ForceManager or filtered forces
-                ghohSetForce.UpdateServoForces();
+                // Update forces - this now handles both filtered and unfiltered forces
+                ForceManager.UpdateForces();
 
                 HDdll.hdEndFrame(deviceHandle);
 
