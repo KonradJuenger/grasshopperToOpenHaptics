@@ -1,9 +1,11 @@
 ﻿using System;
+using System.Diagnostics;
 
 namespace ghoh
 {
     public static class ForceManager
     {
+        private static DateTime lastUpdateTime = DateTime.Now;
         // Flags for enabled forces
         private static bool directForceEnabled;
         private static bool pullToPointEnabled;
@@ -151,10 +153,16 @@ namespace ghoh
 
         public static void UpdateForces()
         {
+            DateTime currentTime = DateTime.Now;
+            //TimeSpan interval = currentTime - lastUpdateTime;
+            //lastUpdateTime = currentTime;
+            //Logger.Log($"Time between updates: {interval.TotalMilliseconds} ms");
+
             var totalForce = new double[3];
             var transform = new double[16];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
 
+            // Extract device orientation vectors
             var xDirection = new DeviceManager.Vector3D(
                 -transform[0],
                 transform[2],
@@ -168,10 +176,24 @@ namespace ghoh
             );
 
             var zDirection = new DeviceManager.Vector3D(
-                xDirection.Y * yDirection.Z - xDirection.Z * yDirection.Y,
-                xDirection.Z * yDirection.X - xDirection.X * yDirection.Z,
-                xDirection.X * yDirection.Y - xDirection.Y * yDirection.X
+                -transform[8],
+                transform[10],
+                transform[9]
             );
+
+            // Normalize the Z vector (up direction)
+            double length = Math.Sqrt(
+                zDirection.X * zDirection.X +
+                zDirection.Y * zDirection.Y +
+                zDirection.Z * zDirection.Z
+            );
+
+            if (length > 0.001)
+            {
+                zDirection.X /= length;
+                zDirection.Y /= length;
+                zDirection.Z /= length;
+            }
 
             var devicePos = new DeviceManager.Vector3D(
                 -transform[12],
@@ -214,8 +236,30 @@ namespace ghoh
                     totalForce[i] += currentDirectForce[i];
             }
 
+            // Apply microcontroller force in device Z (up) direction if enabled
+            if (UCManager.IsConnected && UCManager.ForceEnabled)
+            {
+                double forceValue = UCManager.GetMappedForceValue();
+                Logger.Log($"Raspi ADC value: {forceValue}");
+
+                if (forceValue > 0.001) // Only apply if there's a meaningful force
+                {
+                    // Apply the force along the device's up direction (Z axis)
+                    double fx = zDirection.X * forceValue;
+                    double fy = zDirection.Y * forceValue;
+                    double fz = zDirection.Z * forceValue;
+
+                    // Convert to device coordinates
+                    totalForce[0] += -fx; // Negate X for device space
+                    totalForce[1] += fz;  // Y becomes Z
+                    totalForce[2] += fy;  // Z becomes Y
+                }
+            }
+
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
+
         }
+
 
         private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos)
         {

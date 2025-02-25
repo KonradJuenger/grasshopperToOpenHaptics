@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System;
+using System.IO.Ports;
 
 public static class DeviceManager
 {
@@ -141,6 +142,8 @@ public static class DeviceManager
             oldState.ReturnArrays();
             arrayPool.Return(buttons);
 
+            // Update all forces (including microcontroller forces)
+            // This is now handled directly in ForceManager.UpdateForces()
             ForceManager.UpdateForces();
 
             HDdll.hdEndFrame(deviceHandle);
