@@ -2,7 +2,6 @@
 using System.IO.Ports;
 using System.Threading;
 using System.Threading.Tasks;
-using System.IO.Ports;
 
 namespace ghoh
 {
@@ -17,6 +16,12 @@ namespace ghoh
         // Latest raw ADC value read from the microcontroller
         private static int currentRawValue = 0;
         private static readonly object valueLock = new object();
+
+        // Moving average filter
+        private static MovingAverageFilter filter;
+        private static bool filterEnabled = true;
+        private static int filterWindowSize = 10; // Default window size
+        private static readonly object filterLock = new object();
 
         // Force parameters
         private static bool forceEnabled = false;
@@ -56,6 +61,31 @@ namespace ghoh
             }
         }
 
+        public static int FilteredValue
+        {
+            get
+            {
+                lock (filterLock)
+                {
+                    if (filter == null || !filterEnabled)
+                        return CurrentRawValue;
+
+                    return filter.GetCurrentValue();
+                }
+            }
+        }
+
+        public static bool FilterEnabled
+        {
+            get
+            {
+                lock (filterLock)
+                {
+                    return filterEnabled;
+                }
+            }
+        }
+
         public static bool ForceEnabled
         {
             get
@@ -70,7 +100,7 @@ namespace ghoh
         public static double GetMappedForceValue()
         {
             double scale, inMin, inMax, outMin, outMax;
-            int rawValue;
+            int valueToUse;
 
             lock (paramLock)
             {
@@ -81,13 +111,24 @@ namespace ghoh
                 outMax = outputMax;
             }
 
-            lock (valueLock)
+            // Use filtered or raw value based on filter setting
+            lock (filterLock)
             {
-                rawValue = currentRawValue;
+                if (filterEnabled && filter != null)
+                {
+                    valueToUse = filter.GetCurrentValue();
+                }
+                else
+                {
+                    lock (valueLock)
+                    {
+                        valueToUse = currentRawValue;
+                    }
+                }
             }
 
-            // Map the raw value to the force range and apply scaling
-            double normalizedValue = (rawValue - inMin) / (inMax - inMin);
+            // Map the value to the force range and apply scaling
+            double normalizedValue = (valueToUse - inMin) / (inMax - inMin);
             double mappedValue = outMin + normalizedValue * (outMax - outMin);
 
             // Apply scaling and ensure it's within bounds
@@ -117,6 +158,12 @@ namespace ghoh
                         DtrEnable = true, // Data Terminal Ready signal
                         RtsEnable = true  // Request To Send signal
                     };
+
+                    // Initialize the moving average filter
+                    lock (filterLock)
+                    {
+                        filter = new MovingAverageFilter(filterWindowSize);
+                    }
 
                     // Open the port
                     serialPort.Open();
@@ -188,6 +235,15 @@ namespace ghoh
                 isConnected = false;
                 CurrentRawValue = 0;
 
+                // Reset the filter
+                lock (filterLock)
+                {
+                    if (filter != null)
+                    {
+                        filter.Reset();
+                    }
+                }
+
                 // Disable force application
                 lock (paramLock)
                 {
@@ -208,12 +264,25 @@ namespace ghoh
                 {
                     string line = serialPort.ReadLine().Trim();
 
-                    // Parse the raw ADC value (which is now just a number)
+                    // Parse the raw ADC value
                     if (int.TryParse(line, out int adcValue))
                     {
-                        // Update the current value
+                        // Update both raw and filtered value
                         CurrentRawValue = adcValue;
-                        Logger.Log("MicrocontrollerManager - Read raw value: " + adcValue);
+
+                        // Apply the moving average filter if enabled
+                        lock (filterLock)
+                        {
+                            if (filterEnabled && filter != null)
+                            {
+                                int filteredValue = filter.AddSample(adcValue);
+                                //Logger.Log($"MicrocontrollerManager - Raw: {adcValue}, Filtered: {filteredValue}");
+                            }
+                            else
+                            {
+                                //Logger.Log("MicrocontrollerManager - Raw value: " + adcValue);
+                            }
+                        }
                     }
                 }
                 catch (TimeoutException)
@@ -244,6 +313,28 @@ namespace ghoh
                 inputMax = inMax;
                 outputMin = outMin;
                 outputMax = outMax;
+            }
+        }
+
+        public static void SetFilterParameters(bool enable, int windowSize)
+        {
+            lock (filterLock)
+            {
+                filterEnabled = enable;
+
+                if (windowSize < 1)
+                    windowSize = 1;
+
+                filterWindowSize = windowSize;
+
+                if (filter != null)
+                {
+                    filter.SetWindowSize(windowSize);
+                }
+                else
+                {
+                    filter = new MovingAverageFilter(windowSize);
+                }
             }
         }
     }

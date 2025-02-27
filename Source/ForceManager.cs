@@ -38,6 +38,24 @@ namespace ghoh
         private static double maxForceValuePlane = 1.0;
         private static double maxDistanceValuePlane = 1.0;
 
+        // Damping parameters
+        private static bool dampingEnabled = false;
+        private static double dampingCoefficient = 0.5; // Default value (range 0-1)
+        private static double derivativeDampingCoefficient = 0.0; // Default value
+        private static DampingMethod currentDampingMethod = DampingMethod.ExponentialSmoothing;
+        private static double[] lastAppliedForce = new double[3]; // To track previous force
+        private static double[] previousForce = new double[3]; // For derivative calculation
+        private static DateTime lastForceUpdateTime = DateTime.Now;
+        private static DateTime lastLogTime = DateTime.MinValue;
+
+        // Enum for damping methods
+        public enum DampingMethod
+        {
+            ExponentialSmoothing,
+            ForceDerivative,
+            Both
+        }
+
         public static void SetTCPOffset(DeviceManager.Vector3D offset)
         {
             tcpOffset = offset;
@@ -84,6 +102,24 @@ namespace ghoh
             {
                 forceFilter.SetNoiseParams(processNoise, measurementNoise);
             }
+        }
+
+        public static void SetDampingParameters(
+            bool enable,
+            double coefficient,
+            double derivativeCoefficient,
+            DampingMethod method)
+        {
+            dampingEnabled = enable;
+
+            // Clamp coefficients to valid ranges
+            dampingCoefficient = Math.Max(0, Math.Min(coefficient, 0.99));
+            derivativeDampingCoefficient = Math.Max(0, Math.Min(derivativeCoefficient, 1.0));
+
+            currentDampingMethod = method;
+
+            Logger.Log($"Damping set: enabled={enable}, coefficient={dampingCoefficient:F2}, " +
+                       $"derivative={derivativeDampingCoefficient:F2}, method={method}");
         }
 
         public static void SetPullToPoint(
@@ -151,6 +187,67 @@ namespace ghoh
             );
         }
 
+        private static double[] ApplyDamping(double[] currentForce, double timeDelta)
+        {
+            if (!dampingEnabled || (dampingCoefficient < 0.01 && derivativeDampingCoefficient < 0.01))
+            {
+                // Store for next time but don't modify force
+                previousForce = (double[])lastAppliedForce.Clone();
+                lastAppliedForce = (double[])currentForce.Clone();
+                return currentForce;
+            }
+
+            double[] dampedForce = new double[3];
+
+            // Apply damping based on selected method
+            switch (currentDampingMethod)
+            {
+                case DampingMethod.ExponentialSmoothing:
+                    // Implement exponential smoothing (1st order low-pass filter)
+                    // alpha is the smoothing factor - lower values mean more smoothing
+                    double alpha = 1.0 - dampingCoefficient;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        dampedForce[i] = alpha * currentForce[i] + dampingCoefficient * lastAppliedForce[i];
+                    }
+                    break;
+
+                case DampingMethod.ForceDerivative:
+                    // Implement force derivative damping
+                    // This applies resistance based on how quickly the force is changing
+                    for (int i = 0; i < 3; i++)
+                    {
+                        double derivative = (currentForce[i] - previousForce[i]) / Math.Max(0.001, timeDelta);
+                        dampedForce[i] = currentForce[i] - (derivativeDampingCoefficient * derivative);
+                    }
+                    break;
+
+                case DampingMethod.Both:
+                    // Apply both methods sequentially
+                    // First apply exponential smoothing
+                    double alphaBoth = 1.0 - dampingCoefficient;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        dampedForce[i] = alphaBoth * currentForce[i] + dampingCoefficient * lastAppliedForce[i];
+                    }
+
+                    // Then apply derivative damping
+                    double[] tempForce = (double[])dampedForce.Clone();
+                    for (int i = 0; i < 3; i++)
+                    {
+                        double derivative = (tempForce[i] - previousForce[i]) / Math.Max(0.001, timeDelta);
+                        dampedForce[i] = tempForce[i] - (derivativeDampingCoefficient * derivative);
+                    }
+                    break;
+            }
+
+            // Store current force as previous for next update
+            previousForce = (double[])lastAppliedForce.Clone();
+            lastAppliedForce = (double[])dampedForce.Clone();
+
+            return dampedForce;
+        }
+
         public static void UpdateForces()
         {
             DateTime currentTime = DateTime.Now;
@@ -208,6 +305,11 @@ namespace ghoh
                 devicePos.Z += tcpOffset.X * xDirection.Z + tcpOffset.Y * yDirection.Z + tcpOffset.Z * zDirection.Z;
             }
 
+            // Track Z position and forces for logging
+            double penZPosition = devicePos.Z;
+            double rawForceValue = 0;
+            double filteredForceValue = 0;
+
             if (pullToPointEnabled)
             {
                 UpdateSmoothedTarget(devicePos);
@@ -239,28 +341,51 @@ namespace ghoh
             // Apply microcontroller force in device Z (up) direction if enabled
             if (UCManager.IsConnected && UCManager.ForceEnabled)
             {
-                double forceValue = UCManager.GetMappedForceValue();
-                Logger.Log($"Raspi ADC value: {forceValue}");
+                rawForceValue = UCManager.GetMappedForceValue();
 
-                if (forceValue > 0.001) // Only apply if there's a meaningful force
+                if (rawForceValue > 0.001) // Only apply if there's a meaningful force
                 {
                     // Apply the force along the device's up direction (Z axis)
-                    double fx = zDirection.X * forceValue;
-                    double fy = zDirection.Y * forceValue;
-                    double fz = zDirection.Z * forceValue;
+                    double fx = zDirection.X * rawForceValue;
+                    double fy = zDirection.Y * rawForceValue;
+                    double fz = zDirection.Z * rawForceValue;
 
                     // Convert to device coordinates
-                    totalForce[0] += -fx; // Negate X for device space
-                    totalForce[1] += fz;  // Y becomes Z
-                    totalForce[2] += fy;  // Z becomes Y
+                    double[] mcForce = new double[3] {
+                -fx, // Negate X for device space
+                fz,  // Y becomes Z
+                fy   // Z becomes Y
+            };
+
+                    // Calculate time delta for damping
+                    double timeDelta = (currentTime - lastForceUpdateTime).TotalSeconds;
+                    lastForceUpdateTime = currentTime;
+
+                    // Apply damping to the microcontroller force
+                    double[] dampedMcForce = ApplyDamping(mcForce, timeDelta);
+
+                    // Calculate filtered force magnitude for logging
+                    double originalMagnitude = Math.Sqrt(mcForce[0] * mcForce[0] + mcForce[1] * mcForce[1] + mcForce[2] * mcForce[2]);
+                    double dampedMagnitude = Math.Sqrt(dampedMcForce[0] * dampedMcForce[0] + dampedMcForce[1] * dampedMcForce[1] + dampedMcForce[2] * dampedMcForce[2]);
+
+                    if (originalMagnitude > 0.0001)
+                        filteredForceValue = rawForceValue * (dampedMagnitude / originalMagnitude);
+                    else
+                        filteredForceValue = 0;
+
+                    // Add the damped force to total force
+                    for (int i = 0; i < 3; i++)
+                        totalForce[i] += dampedMcForce[i];
                 }
             }
 
+            // Log detailed diagnostic information on every update
+            // Include milliseconds in timestamp for higher time resolution
+            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            Logger.Log($"[{timestamp}] Z:{penZPosition:F3}, raw:{rawForceValue:F3}, filt:{filteredForceValue:F3}");
+
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
-
         }
-
-
         private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos)
         {
             var targetToUse = interpolationEnabled ? currentSmoothedTarget : targetPoint;
@@ -331,11 +456,17 @@ namespace ghoh
             pullToPlaneEnabled = false;
             filteredForceEnabled = false;
             interpolationEnabled = false;
+            dampingEnabled = false;
             tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
             if (forceFilter != null)
             {
                 forceFilter.Reset();
             }
+
+            // Reset damping state
+            lastAppliedForce = new double[3];
+            previousForce = new double[3];
+
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, new double[3]);
         }
     }
