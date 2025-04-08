@@ -15,7 +15,7 @@ namespace ghoh
 
         // Direct force parameters
         private static double[] currentDirectForce = new double[3];
-
+        private static double[] currentTotalForce = new double[3];
         // Filtered force support
         private static UKF forceFilter;
         private static double[] lastFilteredForce = new double[3];
@@ -67,7 +67,7 @@ namespace ghoh
         // Moving average filter for viscous forces
         private static VectorMovingAverageFilter viscousForceFilter;
 
-        // Add these fields to the ForceManager class:
+        //plane condtraint parameters
         private static bool planeCollisionEnabled;
         private static DeviceManager.Vector3D collisionPlaneOrigin;
         private static DeviceManager.Vector3D collisionPlaneNormal;
@@ -111,6 +111,11 @@ namespace ghoh
             ExponentialSmoothing,
             ForceDerivative,
             Both
+        }
+        public static double[] GetCurrentForce()
+        {
+            // Return a copy of the current force to avoid external modification
+            return (double[])currentTotalForce.Clone();
         }
         // Update the SetViscousDamping method to support all parameters
         public static Vector3d SetViscousDamping(bool enable, double gain, double maxForce, double deadbandThreshold = 10.0, double softness = 5.0, double filterCoefficient = 0.9, int windowSize = 10){
@@ -750,7 +755,7 @@ namespace ghoh
             // Include milliseconds in timestamp for higher time resolution
             string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
             //Logger.Log($"[{timestamp}] Z:{penZPosition:F3}, raw:{rawForceValue:F3}, filt:{filteredForceValue:F3}");
-
+            currentTotalForce = (double[])totalForce.Clone();
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForce);
         }
 
