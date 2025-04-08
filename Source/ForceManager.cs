@@ -106,6 +106,23 @@ namespace ghoh
         private static double maxForceValueCurve = 1.0;
         private static double maxDistanceValueCurve = 1.0;
         private static double lookAheadDistance = 0.01;
+
+        // New state variables for traveling point functionality
+        private static bool pullCurveFade = false;
+        private static int pullCurveMethod = 0; // 0: tangent direction, 1: travelingPoint
+        private static bool pullAlongEnabled = false;
+        private static double travelingPointSpeed = 10.0; // mm/sec
+        private static double travelingPointPosition = 0.0; // Parameter on curve
+        private static double travelingPointLengthPosition = 0.0; // Length position on curve
+        private static DateTime lastTravelingPointUpdateTime = DateTime.Now;
+        private static bool travelingPointActive = false;
+        private static double totalCurveLength = 0.0;
+        private static double tangentForce = 1.0; // Force multiplier for tangent direction
+
+        // Store both original and transformed curves
+        private static Curve originalPullToCurve = null;
+        private static double originalCurveLength = 0.0;
+
         public enum DampingMethod
         {
             ExponentialSmoothing,
@@ -309,20 +326,67 @@ namespace ghoh
             interpolationEnabled = useInterpolation;
             maxStepSize = stepSize;
         }
+        // Updated method with new parameters
         public static void SetPullToCurve(
             Curve curve,
             bool enable,
             double maxForce,
             double maxDistance,
-            double lookAhead)
+            bool fade,
+            int method,
+            double tangentForceValue,
+            bool pullAlong,
+            double speed,
+            bool reset)
         {
+            // Keep track of both original and transformed curves
+            originalPullToCurve = curve;
             pullToCurve = curve;
             pullToCurveEnabled = enable;
             maxForceValueCurve = Math.Max(0.0, maxForce);
             maxDistanceValueCurve = Math.Max(0.001, maxDistance);
-            lookAheadDistance = Math.Max(0.0, lookAhead);
+            pullCurveFade = fade;
+            pullCurveMethod = Math.Min(1, Math.Max(0, method)); // Clamp to 0 or 1
+            tangentForce = Math.Max(0.0, tangentForceValue); // Single parameter for tangent force
+
+            // PullAlong is the main trigger for both methods
+            bool previousPullAlongEnabled = pullAlongEnabled;
+            pullAlongEnabled = pullAlong;
+            travelingPointSpeed = Math.Max(0.1, speed); // Ensure minimum positive speed
+
+            // Check if reset requested or newly enabled
+            if (reset || (!previousPullAlongEnabled && pullAlongEnabled))
+            {
+                ResetTravelingPoint();
+            }
+
+            // Update curve lengths if curve is valid
+            if (pullToCurve != null)
+            {
+                originalCurveLength = originalPullToCurve.GetLength();
+                totalCurveLength = pullToCurve.GetLength();
+            }
+
+            // Start or stop traveling point as needed
+            // Both methods use pullAlong flag now
+            travelingPointActive = pullToCurveEnabled && pullAlongEnabled;
+            if (!travelingPointActive)
+            {
+                // Reset timestamp when not active to avoid large jumps on re-enable
+                lastTravelingPointUpdateTime = DateTime.Now;
+            }
         }
 
+        // Method to reset traveling point to start of curve
+        private static void ResetTravelingPoint()
+        {
+            travelingPointPosition = 0.0;
+            travelingPointLengthPosition = 0.0;
+            lastTravelingPointUpdateTime = DateTime.Now;
+            travelingPointActive = pullToCurveEnabled && pullAlongEnabled;
+        }
+
+        // Updated method for calculating pull to curve force
         private static double[] CalculatePullToCurveForce(DeviceManager.Vector3D devicePos)
         {
             double[] force = new double[] { 0, 0, 0 };
@@ -342,98 +406,250 @@ namespace ghoh
                 return force; // If no closest point found, return zero force
             }
 
-            // If look ahead is enabled, move parameter forward on curve
-            Point3d targetPoint;
-            if (lookAheadDistance > 0.0)
+            // Calculate position along curve (from start to parameter) for fading
+            double lengthToClosest = 0;
+            if (pullCurveFade)
             {
                 try
                 {
-                    // Get the curve's domain
                     Interval domain = pullToCurve.Domain;
-
-                    // Calculate the length from the start of the curve to our current parameter
-                    double lengthToClosest = 0;
                     if (domain.Min < curveParam)
                     {
                         lengthToClosest = pullToCurve.GetLength(new Interval(domain.Min, curveParam));
                     }
-
-                    // Add our look ahead distance
-                    double targetLength = lengthToClosest + lookAheadDistance;
-
-                    // Get the total curve length
-                    double totalLength = pullToCurve.GetLength();
-
-                    // Make sure we don't exceed the curve length
-                    targetLength = Math.Min(targetLength, totalLength);
-
-                    // Now find the parameter at this length
-                    double newParam = curveParam;
-                    // We need to use the NurbsCurve.GetCurveParameterFromLength method or similar approach
-                    // For simplicity and reliability, we'll use approximation
-
-                    // Get the curve length interval per parameter unit (approx)
-                    double lengthPerParam = totalLength / domain.Length;
-
-                    if (lengthPerParam > 0)
-                    {
-                        // Calculate parameter increment needed
-                        double paramIncrement = lookAheadDistance / lengthPerParam;
-
-                        // Apply increment, staying within domain
-                        newParam = Math.Min(domain.Max, curveParam + paramIncrement);
-
-                        // Get the point at this parameter
-                        targetPoint = pullToCurve.PointAt(newParam);
-                    }
-                    else
-                    {
-                        // Fallback to closest point
-                        targetPoint = pullToCurve.PointAt(curveParam);
-                    }
                 }
                 catch
                 {
-                    // If anything fails, use the closest point
-                    targetPoint = pullToCurve.PointAt(curveParam);
+                    // If length calculation fails, disable fading
+                    lengthToClosest = totalCurveLength;
                 }
             }
-            else
+
+            // Get the closest point on the curve
+            closestPoint = pullToCurve.PointAt(curveParam);
+
+            // CASE 1: Basic pull to curve force (always active)
+            // Calculate direction to the closest point
+            Vector3d directionToClosest = new Vector3d(
+                closestPoint.X - devicePoint.X,
+                closestPoint.Y - devicePoint.Y,
+                closestPoint.Z - devicePoint.Z
+            );
+
+            double distanceToClosest = directionToClosest.Length;
+
+            // Initialize force vector
+            Vector3d resultForce = Vector3d.Zero;
+
+            if (distanceToClosest > 0.001)
             {
-                // Just use the closest point if no look ahead
-                targetPoint = pullToCurve.PointAt(curveParam);
+                // Normalize the direction vector
+                directionToClosest.Unitize();
+
+                // Scale force based on distance
+                double baseForceMagnitude = distanceToClosest > maxDistanceValueCurve ?
+                    maxForceValueCurve :
+                    maxForceValueCurve * (distanceToClosest / maxDistanceValueCurve);
+
+                // Apply fading if enabled
+                if (pullCurveFade && totalCurveLength > 0.001)
+                {
+                    // Calculate fade factor: 0 at start, 1 at end
+                    double fadeFactor = Math.Min(1.0, Math.Max(0.0, lengthToClosest / totalCurveLength));
+
+                    // Apply linear fading
+                    baseForceMagnitude *= fadeFactor;
+                }
+
+                // Add to result force
+                resultForce = directionToClosest * baseForceMagnitude;
             }
 
-            // Calculate distance and direction to target point
-            double dx = targetPoint.X - devicePoint.X;
-            double dy = targetPoint.Y - devicePoint.Y;
-            double dz = targetPoint.Z - devicePoint.Z;
-            double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-
-            // Calculate force based on distance
-            if (distance < 0.001)
+            // CASE 2: Pull along functionality based on method
+            if (pullAlongEnabled)
             {
-                return force; // No force if already at target
+                if (pullCurveMethod == 0) // Tangent direction method
+                {
+                    try
+                    {
+                        // Get the tangent vector at the closest point
+                        Vector3d tangent = pullToCurve.TangentAt(curveParam);
+
+                        // Ensure the tangent is valid
+                        if (tangent.Length > 0.001)
+                        {
+                            // Normalize the tangent vector
+                            tangent.Unitize();
+
+                            // Calculate tangent force magnitude
+                            double tangentForceMagnitude = maxForceValueCurve * tangentForce;
+
+                            // Apply fading if enabled
+                            if (pullCurveFade && totalCurveLength > 0.001)
+                            {
+                                // Calculate fade factor: 0 at start, 1 at end
+                                double fadeFactor = Math.Min(1.0, Math.Max(0.0, lengthToClosest / totalCurveLength));
+
+                                // Apply linear fading
+                                tangentForceMagnitude *= fadeFactor;
+                            }
+
+                            // Add tangent force to result
+                            resultForce += tangent * tangentForceMagnitude;
+
+                            // Log tangent info for debugging
+                            Logger.Log($"Tangent: {tangent.X:F3}, {tangent.Y:F3}, {tangent.Z:F3}, " +
+                                      $"Force: {tangentForceMagnitude:F2}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log errors
+                        Logger.Log($"Tangent calculation error: {ex.Message}");
+                    }
+                }
+                else // Method 1: Traveling point - REVERTED TO PREVIOUS WORKING VERSION
+                {
+                    // Update traveling point position if active
+                    if (travelingPointActive)
+                    {
+                        UpdateTravelingPointPosition();
+                    }
+
+                    // Get the point at the current traveling point position
+                    Point3d targetPoint = pullToCurve.PointAt(travelingPointPosition);
+
+                    // Calculate direction and distance to the traveling point
+                    double dx = targetPoint.X - devicePoint.X;
+                    double dy = targetPoint.Y - devicePoint.Y;
+                    double dz = targetPoint.Z - devicePoint.Z;
+                    double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (distance > 0.001)
+                    {
+                        // Calculate force magnitude
+                        double travelingForceMagnitude = distance > maxDistanceValueCurve ?
+                            maxForceValueCurve :
+                            maxForceValueCurve * (distance / maxDistanceValueCurve);
+
+                        // Apply fading if enabled
+                        if (pullCurveFade && totalCurveLength > 0.001)
+                        {
+                            // Calculate fade factor: 0 at start, 1 at end
+                            double fadeFactor = Math.Min(1.0, Math.Max(0.0, lengthToClosest / totalCurveLength));
+
+                            // Apply linear fading
+                            travelingForceMagnitude *= fadeFactor;
+                        }
+
+                        // Calculate force components - this replaces the base pull force
+                        resultForce = new Vector3d(
+                            (dx / distance) * travelingForceMagnitude,
+                            (dy / distance) * travelingForceMagnitude,
+                            (dz / distance) * travelingForceMagnitude
+                        );
+                    }
+                }
             }
 
-            // Scale force based on distance
-            double forceMagnitude = distance > maxDistanceValueCurve ?
-                maxForceValueCurve :
-                maxForceValueCurve * (distance / maxDistanceValueCurve);
-
-            // Calculate force components
-            double fx = (dx / distance) * forceMagnitude;
-            double fy = (dy / distance) * forceMagnitude;
-            double fz = (dz / distance) * forceMagnitude;
-
-            // Return force in device coordinates
+            // Convert to device coordinates
             return new double[]
             {
-        -fx, // Negate X for device space
-        fz,  // Y becomes Z
-        fy   // Z becomes Y
+                -resultForce.X, // Negate X for device space
+                resultForce.Z,  // Y becomes Z
+                resultForce.Y   // Z becomes Y
             };
         }
+
+        // Helper method to find a curve parameter at a specific length
+        private static double FindParameterAtLength(Curve curve, double targetLength)
+        {
+            if (curve == null || targetLength <= 0)
+                return curve.Domain.Min;
+
+            if (targetLength >= curve.GetLength())
+                return curve.Domain.Max;
+
+            Interval domain = curve.Domain;
+            double totalLength = curve.GetLength();
+
+            // Binary search to find parameter at length
+            double minParam = domain.Min;
+            double maxParam = domain.Max;
+            double midParam;
+            double midLength;
+
+            // Precision threshold for convergence
+            double precision = 0.001;
+            int maxIterations = 20;
+            int iterations = 0;
+
+            while (maxParam - minParam > precision && iterations < maxIterations)
+            {
+                midParam = (minParam + maxParam) / 2.0;
+                midLength = curve.GetLength(new Interval(domain.Min, midParam));
+
+                if (Math.Abs(midLength - targetLength) < precision)
+                {
+                    return midParam;
+                }
+
+                if (midLength < targetLength)
+                {
+                    minParam = midParam;
+                }
+                else
+                {
+                    maxParam = midParam;
+                }
+
+                iterations++;
+            }
+
+            // Return best approximation after max iterations
+            return (minParam + maxParam) / 2.0;
+        }
+
+        // Method to update the traveling point position based on time and speed
+        private static void UpdateTravelingPointPosition()
+        {
+            // Calculate time delta since last update
+            DateTime currentTime = DateTime.Now;
+            double timeDelta = Math.Max(0.001, (currentTime - lastTravelingPointUpdateTime).TotalSeconds);
+            lastTravelingPointUpdateTime = currentTime;
+
+            if (pullToCurve == null || totalCurveLength < 0.001)
+                return;
+
+            // Calculate how far to move in mm
+            double distanceToMove = travelingPointSpeed * timeDelta;
+
+            // Get curve domain
+            Interval domain = pullToCurve.Domain;
+
+            // If we're already at the end, don't move further
+            if (travelingPointLengthPosition >= totalCurveLength)
+                return;
+
+            try
+            {
+                // Calculate target length (don't exceed total length)
+                double targetLength = Math.Min(totalCurveLength, travelingPointLengthPosition + distanceToMove);
+
+                // Update the length position
+                travelingPointLengthPosition = targetLength;
+
+                // Find the parameter at this length using more accurate method
+                travelingPointPosition = FindParameterAtLength(pullToCurve, targetLength);
+            }
+            catch (Exception ex)
+            {
+                // Log error if calculation fails
+                Logger.Log($"Error updating traveling point: {ex.Message}");
+            }
+        }
+
+
         public static void SetPullToPlane(
             DeviceManager.Vector3D origin,
             DeviceManager.Vector3D normal,
@@ -1095,8 +1311,19 @@ namespace ghoh
 
         public static void Reset()
         {
-            pullToCurveEnabled = false;
-            pullToCurve = null;
+
+            pullCurveFade = false;
+            pullCurveMethod = 0;
+            pullAlongEnabled = false;
+            travelingPointSpeed = 10.0;
+            tangentForce = 1.0;
+            travelingPointPosition =
+            travelingPointLengthPosition = 0.0;
+            lastTravelingPointUpdateTime = DateTime.Now;
+            travelingPointActive = false;
+            totalCurveLength = 0.0;
+            originalCurveLength = 0.0;
+            originalPullToCurve = null;
 
             directForceEnabled = false;
             pullToPointEnabled = false;
