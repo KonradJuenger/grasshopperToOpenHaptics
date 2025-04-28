@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System;
 using System.IO.Ports;
+using System.Collections.Concurrent; // Ensure this is present
 
 public static class DeviceManager
 {
@@ -15,8 +16,9 @@ public static class DeviceManager
     private static readonly object stateLock = new object();
     private static long isRunningFlag; // 0 = false, 1 = true
 
-    private static UKF forceFilter;
-    private static bool filterEnabled = true;
+    // Removed unused filter fields unless they are used elsewhere
+    // private static UKF forceFilter;
+    // private static bool filterEnabled = true;
 
     public struct DeviceState
     {
@@ -78,13 +80,18 @@ public static class DeviceManager
             HDdll.hdEnable(HDdll.HD_FORCE_OUTPUT);
 
             // Initialize state
-            Interlocked.Exchange(ref isRunningFlag, 1);
+            Interlocked.Exchange(ref isRunningFlag, 1); // Set flag to running
             lock (stateLock)
             {
-                currentState = new DeviceState
+                // Initialize only if null or create a new one
+                if (currentState.Transform == null)
                 {
-                    Transform = arrayPool.Rent(16)
-                };
+                    currentState = new DeviceState
+                    {
+                        Transform = arrayPool.Rent(16),
+                        Buttons = 0 // Initialize buttons
+                    };
+                }
             }
 
             IntPtr callbackHandle = HDdll.hdScheduleAsynchronous(
@@ -98,6 +105,9 @@ public static class DeviceManager
                 HDdll.HDErrorInfo err = HDdll.hdGetError();
                 IntPtr errPtr = HDdll.hdGetErrorString(err.ErrorCode);
                 errorMessage = Marshal.PtrToStringAnsi(errPtr);
+                // Cleanup if scheduler fails
+                HDdll.hdDisableDevice(deviceHandle);
+                deviceHandle = HDdll.HD_INVALID_HANDLE;
                 return false;
             }
 
@@ -111,92 +121,164 @@ public static class DeviceManager
 
     private static uint ServoLoopCallback(IntPtr userData)
     {
-        if (deviceHandle == HDdll.HD_INVALID_HANDLE || Interlocked.Read(ref isRunningFlag) == 0)
+        // Check run flag first
+        if (Interlocked.Read(ref isRunningFlag) == 0)
+            return HDdll.HD_CALLBACK_DONE; // Stop if flag is 0
+
+        // Check handle (less likely to change but good practice)
+        if (deviceHandle == HDdll.HD_INVALID_HANDLE)
             return HDdll.HD_CALLBACK_DONE;
 
         try
         {
             HDdll.hdBeginFrame(deviceHandle);
 
-            // Get transform and buttons
-            var transform = arrayPool.Rent(16);
-            var buttons = arrayPool.Rent(1);
+            // Use temporary arrays for HD calls
+            var tempTransform = arrayPool.Rent(16);
+            var tempButtons = arrayPool.Rent(1); // Use size 1 for button array
 
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transform);
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, buttons);
+            HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, tempTransform);
+            HDdll.hdGetDoublev(HDdll.HD_CURRENT_BUTTONS, tempButtons);
 
-            // Update cached state
-            var newState = new DeviceState
-            {
-                Transform = transform,
-                Buttons = (int)buttons[0]
-            };
-
+            // Update cached state safely
             DeviceState oldState;
             lock (stateLock)
             {
-                oldState = currentState;
-                currentState = newState;
+                oldState = currentState; // Get old state to return its array
+                                         // Update currentState with the *new* arrays
+                currentState = new DeviceState
+                {
+                    Transform = tempTransform, // Assign the newly rented array
+                    Buttons = (int)tempButtons[0]
+                };
             }
+            // Return the *old* transform array outside the lock
+            if (oldState.Transform != null)
+            {
+                oldState.ReturnArrays();
+            }
+            arrayPool.Return(tempButtons); // Return the temporary button array
 
-            oldState.ReturnArrays();
-            arrayPool.Return(buttons);
 
-            // Update all forces (including microcontroller forces)
-            // This is now handled directly in ForceManager.UpdateForces()
+            // Update forces - ensure ForceManager exists and is initialized elsewhere
             ForceManager.UpdateForces();
+
+
+            // --- Servo Logging ---
+            if (ServoLogger.IsRecording)
+            {
+                // Get the force that was just set
+                double[] currentForce = ForceManager.GetCurrentForce();
+
+                var entry = new ServoLogger.LogEntry();
+
+                if (ServoLogger.RecordingStopwatch.IsRunning)
+                {
+                    entry.TimestampMicroseconds = ServoLogger.RecordingStopwatch.Elapsed.Ticks / (TimeSpan.TicksPerMillisecond / 1000);
+                }
+                else { entry.TimestampMicroseconds = -1; } // Indicate stopwatch wasn't running
+
+                // Use the transform data *currently* in currentState
+                // Need to read inside lock to ensure consistency? Or use tempTransform?
+                // Using tempTransform is safer as currentState might change between here and lock below
+                entry.PosX = tempTransform[12];
+                entry.PosY = tempTransform[13];
+                entry.PosZ = tempTransform[14];
+
+                entry.ForceX = currentForce[0];
+                entry.ForceY = currentForce[1];
+                entry.ForceZ = currentForce[2];
+
+                ServoLogger.LogQueue.Enqueue(entry);
+            }
+            // --- END: Servo Logging ---
 
             HDdll.hdEndFrame(deviceHandle);
 
-            return HDdll.HD_CALLBACK_CONTINUE;
+            return HDdll.HD_CALLBACK_CONTINUE; // Continue the loop
         }
         catch (Exception ex)
         {
             Logger.Log($"Error in servo loop: {ex.Message}");
-            return HDdll.HD_CALLBACK_DONE;
+            // Consider stopping the loop on error
+            Interlocked.Exchange(ref isRunningFlag, 0); // Stop loop on error
+            ServoLogger.Reset(); // Reset logger state on error
+            return HDdll.HD_CALLBACK_DONE; // Stop the loop
         }
     }
 
+    // CORRECTED GetCurrentState
     public static DeviceState GetCurrentState()
     {
-        if (deviceHandle == HDdll.HD_INVALID_HANDLE)
-            return new DeviceState();
+        if (deviceHandle == HDdll.HD_INVALID_HANDLE || Interlocked.Read(ref isRunningFlag) == 0)
+            return new DeviceState { Transform = null, Buttons = 0 }; // Return empty/invalid state
 
-        // Return copy of current state
-        DeviceState state;
+        DeviceState stateToReturn;
         lock (stateLock)
         {
-            state = currentState;
-            var newTransform = arrayPool.Rent(16);
+            // Make a *copy* of the current state data for the caller
+            var state = currentState; // Get current state inside lock
 
-            Array.Copy(state.Transform, newTransform, 16);
-
-            return new DeviceState
+            // Check if transform exists before copying
+            if (state.Transform == null)
             {
-                Transform = newTransform,
+                return new DeviceState { Transform = null, Buttons = state.Buttons };
+            }
+
+            var newTransform = arrayPool.Rent(16); // Rent a new array for the copy
+            try
+            {
+                Array.Copy(state.Transform, newTransform, 16);
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"Error copying transform in GetCurrentState: {ex.Message}");
+                arrayPool.Return(newTransform); // Return rented array on error
+                return new DeviceState { Transform = null, Buttons = state.Buttons };
+            }
+
+
+            stateToReturn = new DeviceState
+            {
+                Transform = newTransform, // Give the copy to the caller
                 Buttons = state.Buttons
             };
+
+            // DO NOT put ServoLogger.Reset() or Interlocked.Exchange here!
         }
+        return stateToReturn; // Return the copy
     }
 
+    // CORRECTED Deinitialize
     public static void Deinitialize()
     {
         lock (deviceLock)
         {
+            // Reset logger state FIRST
+            ServoLogger.Reset();
+
+            // Signal servo loop to stop
             Interlocked.Exchange(ref isRunningFlag, 0);
 
             if (deviceHandle != HDdll.HD_INVALID_HANDLE)
             {
-                ForceManager.Reset();
+                // Need to ensure scheduler stops before disabling device
                 HDdll.hdStopScheduler();
+                ForceManager.Reset(); // Reset forces before disabling
                 HDdll.hdDisableDevice(deviceHandle);
-                deviceHandle = HDdll.HD_INVALID_HANDLE;
+                deviceHandle = HDdll.HD_INVALID_HANDLE; // Mark as invalid
+                Logger.Log("DeviceManager Deinitialized.");
             }
 
+            // Clean up state arrays outside device handle check
             lock (stateLock)
             {
-                var state = currentState;
-                state.ReturnArrays();
+                if (currentState.Transform != null)
+                {
+                    var state = currentState;
+                    currentState = new DeviceState { Transform = null, Buttons = 0 }; // Clear current state
+                    state.ReturnArrays(); // Return the old array
+                }
             }
         }
     }
