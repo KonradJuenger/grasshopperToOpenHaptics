@@ -6,64 +6,86 @@ using System.IO;
 using System.Linq;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 
 namespace ghoh
 {
-    // Simple struct to hold parsed log data (Internal to prevent potential conflicts if reused elsewhere)
-    internal struct ReplayEntry_ghohReplay // Renamed struct slightly to avoid potential name clashes if defined elsewhere
+    // Structure to hold parsed log data for one frame/entry
+    internal struct ReplayFrameData // Renamed struct
     {
         public long TimeMicroseconds;
-        public Point3d DevicePosition;
-        public Vector3d DeviceForce;
+        // Store the raw 4x4 device transform matrix (OpenHaptics format) read from log
+        public double[] TransformMatrix; // Length 16
+        // Store the total force vector read from log (though not directly output)
+        public double[] TotalForce;      // Length 3
+
+        // Constructor for initialization
+        public ReplayFrameData(long timestamp, double[] transform, double[] force)
+        {
+            TimeMicroseconds = timestamp;
+            // Copy data
+            TransformMatrix = new double[16];
+            if (transform != null && transform.Length == 16)
+                Array.Copy(transform, TransformMatrix, 16);
+
+            TotalForce = new double[3];
+            if (force != null && force.Length == 3)
+                Array.Copy(force, TotalForce, 3);
+        }
+        // Add parameterless constructor for completeness if needed elsewhere
+        // public ReplayFrameData() {
+        //    TimeMicroseconds = 0;
+        //    TransformMatrix = new double[16];
+        //    TotalForce = new double[3];
+        // }
     }
 
     public class ghohReplay : GH_Component
     {
         // --- Fields ---
-        private List<ReplayEntry_ghohReplay> logData = new List<ReplayEntry_ghohReplay>();
+        private List<ReplayFrameData> logData = new List<ReplayFrameData>();
         private string currentFilePath = "";
         private bool isRunning = false;
         private bool previousRunState = false;
-        private Transform recordedWorldTransform = Transform.Identity; // Store transform parsed from log
+        private bool previousLoadState = false; // For load button rising edge
+
+        // Parsed header data (Unchanged)
+        private Transform recordedWorldTransform = Transform.Identity;
+        private Vector3d recordedTCPOffset = Vector3d.Zero;
+        private Point3d recordedCamLocation = Point3d.Origin;
+        private Point3d recordedCamTarget = Point3d.Origin;
+        private double recordedLensLength = 50.0;
+        private Vector3d recordedCamUp = Vector3d.ZAxis;
+
+        // Playback state (Unchanged)
         private long startTimeUs = 0;
         private long endTimeUs = 0;
-        private int currentFrameNumber = -1; // Use -1 to indicate not running/before start
-        private double frameDurationUs = 0; // Calculated from FPS input
+        private int currentFrameNumber = -1;
+        private double frameDurationUs = 0;
 
-        // *** New Field for collecting runtime messages ***
+        // Cached last calculated outputs for display when stopped/idle
+        private Plane lastCalculatedDevicePlane = Plane.Unset;
+        private Plane lastCalculatedWorldPlane = Plane.Unset;
+        private Vector3d lastCalculatedTotalForce = Vector3d.Zero;
+        private int lastCalculatedFrameIndex = -1; // Track which frame the cache is for
+
+        // Runtime messages
         private List<string> runtimeMessages = new List<string>();
         // --- End Fields ---
 
         public ghohReplay() : base(
             "ghohReplay",
             "ReplayServoLog",
-            "Replays device data from log. Calculates world pos using recorded or input transform. Outputs frame number and runtime log.", // Updated desc
+            "Replays log data frame by frame or loads frame 0. Outputs header info, total force, and calculated planes.", // Updated desc
             "ghoh",
             "Utility")
         {
         }
 
-        // --- New Helper Method for Logging ---
-        /// <summary>
-        /// Adds message to component runtime messages (balloon) and internal list for output parameter.
-        /// </summary>
-        private void LogAndAddMessage(GH_RuntimeMessageLevel level, string message)
-        {
-            string prefix = level switch
-            {
-                GH_RuntimeMessageLevel.Error => "[ERROR] ",
-                GH_RuntimeMessageLevel.Warning => "[WARN] ",
-                GH_RuntimeMessageLevel.Remark => "[INFO] ", // Using INFO for Remark for clarity
-                _ => ""
-            };
-            runtimeMessages.Add(prefix + message); // Add to list for output
-            AddRuntimeMessage(level, message); // Add for standard GH pop-up balloon
-        }
-        // --- End Helper Method ---
+        // --- Helper Method for Logging --- (Unchanged)
+        private void LogAndAddMessage(GH_RuntimeMessageLevel level, string message) { /* ... */ }
 
-
-        // Clear runtime messages before each solution calculation
-        protected override void BeforeSolveInstance()
+        protected override void BeforeSolveInstance() // (Unchanged)
         {
             runtimeMessages.Clear();
             base.BeforeSolveInstance();
@@ -72,487 +94,640 @@ namespace ghoh
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
-            pManager.AddTextParameter("LogFolderPath", "Path", "Base directory containing the numbered run subfolders", GH_ParamAccess.item); // Index 0
-            pManager.AddIntegerParameter("RunNumber", "Num", "The specific run number folder to replay (e.g., 1, 2, 112)", GH_ParamAccess.item, 1); // Index 1
-            pManager.AddBooleanParameter("Run", "R", "Set to True to start/continue playback, False to stop/reset", GH_ParamAccess.item, false); // Index 2
-            pManager.AddNumberParameter("FPS", "FPS", "Target resampling Frames Per Second (e.g., 29.97, >0 required)", GH_ParamAccess.item, 30.0); // Index 3
-            pManager.AddIntegerParameter("SubsampleFactor", "Sub", "Average force over N data points around target frame (1 = no subsampling)", GH_ParamAccess.item, 1); // Index 4
-            pManager.AddTransformParameter("WorldTransform", "X", "[Optional] If provided, overrides the transform read from the log file for WorldPosition output.", GH_ParamAccess.item); // Index 5
-            pManager[5].Optional = true; // Make transform optional
+            pManager.AddTextParameter("LogFolderPath", "Path", "Base directory for recording run subfolders", GH_ParamAccess.item); // 0
+            pManager.AddIntegerParameter("RunNumber", "Num", "The specific run number folder to replay", GH_ParamAccess.item, 1); // 1
+            pManager.AddBooleanParameter("Load", "L", "Trigger to load/reload data and show Frame 0", GH_ParamAccess.item, false); // 2 - ADDED
+            pManager.AddBooleanParameter("Run", "R", "Set to True to start/continue playback, False to stop/reset", GH_ParamAccess.item, false); // 3
+            pManager.AddNumberParameter("FPS", "FPS", "Target resampling Frames Per Second", GH_ParamAccess.item, 30.0); // 4
+            pManager.AddTransformParameter("WorldTransform", "WldX", "[Optional] Overrides recorded WorldTransform.", GH_ParamAccess.item); // 5
+            pManager.AddVectorParameter("TCPOffset", "TCP", "[Optional] Overrides recorded TCPOffset.", GH_ParamAccess.item); // 6
+            pManager[5].Optional = true;
+            pManager[6].Optional = true;
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
-            pManager.AddNumberParameter("TimeMicroseconds", "Tus", "Timestamp of the chosen frame's data point from log file (microseconds)", GH_ParamAccess.item); // Index 0
-            pManager.AddPointParameter("DevicePosition", "DevPos", "Raw device position from log file for the chosen frame", GH_ParamAccess.item); // Index 1
-            pManager.AddPointParameter("WorldPosition", "WldPos", "Calculated world position (using recorded or input transform) for the chosen frame", GH_ParamAccess.item); // Index 2
-            pManager.AddVectorParameter("DeviceForce", "DevFrc", "Raw (potentially subsampled) device force from log file for the chosen frame", GH_ParamAccess.item); // Index 3
-            pManager.AddTextParameter("Status", "S", "Playback status", GH_ParamAccess.item); // Index 4
-            // *** New Output Parameters ***
-            pManager.AddIntegerParameter("FrameNumber", "FN", "Current playback frame number (0-based). -1 if stopped/idle.", GH_ParamAccess.item); // Index 5
-            pManager.AddTextParameter("RuntimeLog", "Log", "Log of runtime messages (errors, warnings, info)", GH_ParamAccess.list); // Index 6
+            // ORDER: Status, Frame#, Header Info..., Calculated Planes & Force, Log
+            pManager.AddTextParameter("Status", "S", "Playback status", GH_ParamAccess.item); // 0
+            pManager.AddIntegerParameter("FrameNumber", "FN", "Current playback frame number (-1 if stopped/idle)", GH_ParamAccess.item); // 1
+            // Header Data Outputs
+            pManager.AddTransformParameter("RecordedWorldTransform", "RecWldX", "WorldTransform read from log.", GH_ParamAccess.item); // 2
+            pManager.AddVectorParameter("RecordedTCPOffset", "RecTCP", "TCPOffset read from log.", GH_ParamAccess.item); // 3
+            // Camera Outputs
+            pManager.AddPointParameter("camLocation", "CamLoc", "Recorded Camera Location.", GH_ParamAccess.item); // 4
+            pManager.AddPointParameter("camTarget", "CamTgt", "Recorded Camera Target.", GH_ParamAccess.item); // 5
+            pManager.AddNumberParameter("lensLength", "Lens", "Recorded Camera Lens Length.", GH_ParamAccess.item); // 6
+            pManager.AddVectorParameter("camUp", "CamUp", "Recorded Camera Up Vector.", GH_ParamAccess.item); // 7
+            // Calculated Outputs
+            pManager.AddPlaneParameter("DevicePlane", "DevPln", "Calculated device plane (inc. TCP offset).", GH_ParamAccess.item); // 8
+            pManager.AddPlaneParameter("WorldPlane", "WldPln", "Calculated world plane (inc. TCP & World transform).", GH_ParamAccess.item); // 9
+            pManager.AddVectorParameter("TotalForce", "TF", "Recorded Total Force vector (device coordinates).", GH_ParamAccess.item); // 10 - ADDED
+            // Runtime Log Output
+            pManager.AddTextParameter("RuntimeLog", "Log", "Log of runtime messages.", GH_ParamAccess.list); // 11
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            string folderPath = ""; int runNumber = 1; bool run = false;
-            double fps = 30.0; int subsample = 1;
-            Transform inputTransform = Transform.Identity; bool transformInputProvided = false; // Flag to track input connection
-
-            CultureInfo culture = CultureInfo.InvariantCulture; // Use invariant culture for parsing
-
             // --- Input Acquisition ---
-            // Use TryGetData for potentially better error handling if inputs are unexpectedly disconnected
-            if (!DA.GetData(0, ref folderPath)) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "LogFolderPath input missing."); /* Default handled */ }
-            if (!DA.GetData(1, ref runNumber)) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "RunNumber input missing."); /* Default handled */ }
-            if (!DA.GetData(2, ref run)) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "Run input missing."); /* Default handled */ }
-            if (!DA.GetData(3, ref fps)) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "FPS input missing."); /* Default handled */ }
-            if (!DA.GetData(4, ref subsample)) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "SubsampleFactor input missing."); /* Default handled */ }
-            // Check optional transform input (Index 5)
-            transformInputProvided = DA.GetData(5, ref inputTransform); // Optional, uses Identity if not provided or fails
+            string folderPath = ""; int runNumber = 1; bool loadInput = false; bool run = false; double fps = 30.0;
+            Transform inputWorldTransform = Transform.Identity; Vector3d inputTcpOffset = Vector3d.Zero;
+            bool worldTransformInputProvided = false; bool tcpOffsetInputProvided = false;
+            CultureInfo culture = CultureInfo.InvariantCulture;
+
+            DA.GetData(0, ref folderPath); DA.GetData(1, ref runNumber); DA.GetData(2, ref loadInput); // Load trigger
+            DA.GetData(3, ref run); DA.GetData(4, ref fps);
+            worldTransformInputProvided = DA.GetData(5, ref inputWorldTransform);
+            tcpOffsetInputProvided = DA.GetData(6, ref inputTcpOffset);
             // --- End Input Acquisition ---
 
             string status = "Idle";
-            int outputFrameNumber = -1; // Default output frame number when not running
-            subsample = Math.Max(1, subsample); // Ensure >= 1
-            if (fps <= 0)
-            {
-                LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "FPS must be greater than 0. Using 30.0 as fallback.");
-                fps = 30.0;
-            }
-            frameDurationUs = 1000000.0 / fps; // Calculate frame duration in microseconds
+            int outputFrameNumber = -1; // Frame number to output
+
+            if (fps <= 0) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "FPS must be > 0. Using 30.0."); fps = 30.0; }
+            frameDurationUs = 1000000.0 / fps;
 
             string runNumberPadded = runNumber.ToString("D5");
-            string targetFilePath = Path.Combine(folderPath ?? "", runNumberPadded, "servo_log.csv"); // Handle potentially null folderPath gracefully
+            string targetFilePath = Path.Combine(folderPath ?? "", runNumberPadded, "servo_log.csv");
 
-            // --- State Management ---
-            if (run && !previousRunState) // Triggered start/resume
+            // --- Detect Load Trigger ---
+            bool loadTriggered = loadInput && !previousLoadState;
+            previousLoadState = loadInput;
+            // --- End Load Trigger ---
+
+            // Determine effective transforms/offsets
+            Vector3d effectiveTcpOffset = tcpOffsetInputProvided ? inputTcpOffset : recordedTCPOffset;
+            Transform effectiveWorldTransform = worldTransformInputProvided ? inputWorldTransform : recordedWorldTransform;
+
+            // --- Load Data on Trigger ---
+            if (loadTriggered)
             {
-                // Load file if it's different or data is empty
-                bool needsLoad = (targetFilePath != currentFilePath || logData.Count == 0);
-                if (!File.Exists(targetFilePath) && needsLoad)
+                LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Load triggered.");
+                isRunning = false; // Stop playback if running
+                currentFrameNumber = -1;
+                string loadStatus = LoadLogFile(targetFilePath, culture); // Load data and parse headers
+                if (loadStatus.StartsWith("OK") && logData.Count > 0)
                 {
-                    status = $"Error: Log file not found: {targetFilePath}";
-                    LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
-                    isRunning = false; // Ensure not running
-                }
-                else if (needsLoad)
-                {
-                    status = LoadLogFile(targetFilePath, culture); // Load data and parse transform
-                    if (!status.StartsWith("OK"))
+                    currentFilePath = targetFilePath;
+                    // Calculate Frame 0 data and cache it
+                    if (CalculatePlanesAndForce(0, effectiveTcpOffset, effectiveWorldTransform, out lastCalculatedDevicePlane, out lastCalculatedWorldPlane, out lastCalculatedTotalForce))
                     {
-                        // Loading failed, LoadLogFile already added message
-                        isRunning = false; // Ensure not running
+                        status = "Loaded Frame 0";
+                        lastCalculatedFrameIndex = 0; // Mark cache as valid for frame 0
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Remark, status);
                     }
                     else
                     {
-                        currentFilePath = targetFilePath; // Update path only on successful load
+                        status = "Load OK, but failed to calculate Frame 0";
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
+                        lastCalculatedFrameIndex = -1; // Mark cache as invalid
+                    }
+                }
+                else if (loadStatus.StartsWith("OK")) // Load OK but no data points
+                {
+                    status = "Load OK, but no data points found.";
+                    LogAndAddMessage(GH_RuntimeMessageLevel.Warning, status);
+                    lastCalculatedFrameIndex = -1;
+                }
+                else // Load failed
+                {
+                    status = loadStatus; // Error message from LoadLogFile
+                    lastCalculatedFrameIndex = -1;
+                }
+                ExpireSolution(true); // Force update outputs after load attempt
+                                      // Set final outputs after load attempt below
+            }
+            // --- End Load Data ---
+
+            // --- State Management (Run/Stop) ---
+            else if (run && !previousRunState) // Start/resume trigger (only if Load not triggered)
+            {
+                if (logData.Count == 0) // Try loading if data isn't present
+                {
+                    LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Run triggered with no data loaded. Attempting load...");
+                    string loadStatus = LoadLogFile(targetFilePath, culture);
+                    if (!loadStatus.StartsWith("OK"))
+                    {
+                        status = loadStatus; // Report error
+                        isRunning = false;
+                    }
+                    else if (logData.Count == 0)
+                    {
+                        status = "Load OK, but no data points found.";
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Warning, status);
+                        isRunning = false;
+                    }
+                    else // Load successful
+                    {
+                        currentFilePath = targetFilePath;
                         LogAndAddMessage(GH_RuntimeMessageLevel.Remark, $"Loaded log file: {targetFilePath}");
                     }
                 }
-                else if (!needsLoad && logData.Count == 0)
-                {
-                    // File path matches, but logData is empty (maybe previous load failed but didn't reset path?)
-                    status = "Error: Log data is empty despite matching file path.";
-                    LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
-                    isRunning = false;
-                }
 
-                // Only proceed if data was successfully loaded (or already loaded) and is present
-                if (logData.Count > 0)
+                if (logData.Count > 0) // Proceed if data is loaded
                 {
-                    if (!isRunning && !status.StartsWith("Error")) // Only set running if no error occurred during load
-                    {
-                        isRunning = true;
-                        currentFrameNumber = 0; // Reset frame number to start from beginning
-                        startTimeUs = logData[0].TimeMicroseconds;
-                        endTimeUs = logData[logData.Count - 1].TimeMicroseconds;
+                    if (!isRunning)
+                    { // Prevent restarting if already running
+                        isRunning = true; currentFrameNumber = (currentFrameNumber < 0) ? 0 : currentFrameNumber; // Start from 0 or resume
                         status = $"Running Frame {currentFrameNumber}";
-                        LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback starting.");
-                        ExpireSolution(true); // Immediately trigger first frame calculation
-                    }
-                }
-                else if (!status.StartsWith("Error")) // If no file/load error, but still no data
-                {
-                    status = "No data loaded or file empty.";
-                    LogAndAddMessage(GH_RuntimeMessageLevel.Warning, status);
-                    isRunning = false; // Can't run without data
-                }
-            }
-            else if (!run && previousRunState) // Triggered stop
-            {
-                if (isRunning) LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback stopped by user.");
-                isRunning = false;
-                currentFrameNumber = -1; // Reset frame number to stopped state
-                status = "Stopped";
-            }
-            previousRunState = run; // Update state for next iteration
-            // --- End State Management ---
-
-
-            // --- Playback Logic ---
-            if (isRunning && logData.Count > 0)
-            {
-                // Calculate the target timestamp for the current frame number
-                // Ensure currentFrameNumber is valid before using
-                if (currentFrameNumber < 0) currentFrameNumber = 0; // Should be 0 if isRunning is true, but safety check
-                outputFrameNumber = currentFrameNumber; // Set output frame number for this iteration
-
-                double targetTimeUs = startTimeUs + currentFrameNumber * frameDurationUs;
-
-                // Check if target time exceeds the duration of the log (+ one frame allowance)
-                // Use endTimeUs directly as the last valid timestamp
-                if (targetTimeUs > endTimeUs + frameDurationUs) // Allow calculation slightly past the end
-                {
-                    status = "Finished";
-                    LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback finished.");
-                    outputFrameNumber = -1; // Indicate finished state for frame number output
-                    // Set outputs to null/default to indicate finish? Or keep last frame? Let's clear.
-                    DA.SetData(0, null); DA.SetData(1, null); DA.SetData(2, null); DA.SetData(3, null);
-                    // Optionally stop isRunning here, or let user toggle Run input
-                    // isRunning = false; // Uncomment to auto-stop after finishing one cycle
-                }
-                else
-                {
-                    // Find the log entry closest to the target time
-                    int closestIndex = FindClosestEntryIndex(targetTimeUs);
-
-                    if (closestIndex < 0)
-                    {
-                        status = "Error finding frame data."; // Should only happen if logData is empty, checked above
-                        LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
-                        outputFrameNumber = -1; // Indicate error state
-                                                // Clear outputs
-                        DA.SetData(0, null); DA.SetData(1, null); DA.SetData(2, null); DA.SetData(3, null);
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback starting/resuming.");
+                        ExpireSolution(true); // Trigger first frame calculation/resume
                     }
                     else
                     {
-                        // Get the representative entry for this frame
-                        ReplayEntry_ghohReplay entry = logData[closestIndex];
+                        status = $"Already Running Frame {currentFrameNumber}"; // If Run stays true
+                    }
+                }
+                // If load failed or no data, isRunning remains false, status holds error
+            }
+            else if (!run && previousRunState) // Stop trigger
+            {
+                if (isRunning) LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback stopped by user.");
+                isRunning = false; currentFrameNumber = -1; status = "Stopped";
+                // Keep last calculated frame data in cache
+            }
+            previousRunState = run; // Update run state *after* checking edges
+                                    // --- End State Management ---
 
-                        // Calculate potentially subsampled force centered around this entry
-                        Vector3d outputForce = CalculateAverageForce(closestIndex, subsample);
 
-                        // --- Calculate World Position ---
-                        Point3d devicePos = entry.DevicePosition;
-                        // 1. Convert raw device position to default Rhino space
-                        Point3d worldPos = new Point3d(-devicePos.X, devicePos.Z, devicePos.Y); // Note coordinate mapping
+            // --- Playback Loop / Update Cache ---
+            if (isRunning && logData.Count > 0)
+            {
+                if (currentFrameNumber < 0) currentFrameNumber = 0; // Should be >= 0 if running
+                outputFrameNumber = currentFrameNumber;
 
-                        // 2. Determine which transform to use: Input overrides Recorded
-                        Transform transformToUse = transformInputProvided ? inputTransform : recordedWorldTransform;
+                double targetTimeUs = startTimeUs + currentFrameNumber * frameDurationUs;
 
-                        // 3. Apply final transform
-                        worldPos.Transform(transformToUse);
-                        // --- End World Position ---
-
-                        // --- Set Outputs ---
-                        DA.SetData(0, (double)entry.TimeMicroseconds); // Timestamp of closest frame (Index 0) - Cast to double maybe safer? Check param type. NumberParameter -> double
-                        DA.SetData(1, devicePos);               // Raw Device Position (Index 1)
-                        DA.SetData(2, worldPos);                // Calculated World Position (Index 2)
-                        DA.SetData(3, outputForce);             // (Potentially) averaged Device Force (Index 3)
-
-                        status = $"Running Frame {currentFrameNumber} (LogT: {entry.TimeMicroseconds / 1000.0:F0}ms)";
-
-                        // Advance to the next target frame number
-                        currentFrameNumber++;
-
-                        // Trigger the next solution calculation if still potentially running
-                        // Check if the *next* frame's target time might still be valid or close
-                        double nextTargetTimeUs = startTimeUs + currentFrameNumber * frameDurationUs;
-                        if (nextTargetTimeUs <= endTimeUs + frameDurationUs * 1.5) // Allow slightly more leeway
+                // Use >= for finish condition check to handle exact match with last timestamp
+                if (targetTimeUs >= endTimeUs + frameDurationUs * 0.1) // Stop if target time passes last entry time (with small tolerance)
+                {
+                    double playbackDurationSec = (currentFrameNumber > 0) ? (currentFrameNumber * frameDurationUs / 1000000.0) : 0.0;
+                    status = $"Finished (Playback: ~{playbackDurationSec:F2}s)";
+                    LogAndAddMessage(GH_RuntimeMessageLevel.Remark, status);
+                    outputFrameNumber = -1;
+                    isRunning = false; // Stop running
+                                       // Keep last calculated frame data in cache
+                }
+                else // Calculate current frame
+                {
+                    int closestIndex = FindClosestEntryIndex(targetTimeUs);
+                    if (closestIndex >= 0)
+                    {
+                        // Calculate and cache data for this frame
+                        if (CalculatePlanesAndForce(closestIndex, effectiveTcpOffset, effectiveWorldTransform, out lastCalculatedDevicePlane, out lastCalculatedWorldPlane, out lastCalculatedTotalForce))
                         {
-                            ExpireSolution(true);
+                            status = $"Running Frame {currentFrameNumber} (LogT: {logData[closestIndex].TimeMicroseconds / 1000.0:F0}ms)";
+                            lastCalculatedFrameIndex = closestIndex; // Update cache index
+                            currentFrameNumber++; // Advance frame
+                            ExpireSolution(true); // Schedule next update
                         }
-                        else
+                        else // Error calculating
                         {
-                            // If the next frame is definitely past the end, update status immediately
-                            status = "Finished";
-                            LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Playback finished (end of data reached).");
-                            outputFrameNumber = -1; // Indicate finished state
-                                                    // Clear outputs to signify end
-                            DA.SetData(0, null); DA.SetData(1, null); DA.SetData(2, null); DA.SetData(3, null);
-                            // isRunning = false; // Uncomment to auto-stop
+                            status = $"Error calc planes/force for Frame {currentFrameNumber} (Log Index {closestIndex})";
+                            LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
+                            outputFrameNumber = -1; isRunning = false; lastCalculatedFrameIndex = -1;
                         }
+                    }
+                    else // Error finding index
+                    {
+                        status = "Error finding frame data.";
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Error, status);
+                        outputFrameNumber = -1; isRunning = false; lastCalculatedFrameIndex = -1;
                     }
                 }
             }
-            else if (isRunning && logData.Count == 0)
-            {
-                // This state should ideally be caught during the start trigger
-                status = "Running, but no log data loaded.";
-                LogAndAddMessage(GH_RuntimeMessageLevel.Warning, status);
-                outputFrameNumber = -1; // Indicate invalid state
-            }
-            else if (!isRunning)
-            {
-                // Update status message when stopped/idle
-                outputFrameNumber = -1; // Ensure frame number is -1 when stopped
-                if (File.Exists(targetFilePath) && status == "Idle")
-                {
-                    status = "Ready"; // Indicate ready if stopped and file exists
-                }
-                else if (!File.Exists(targetFilePath) && status == "Idle")
-                {
-                    status = $"Log file not found: {runNumberPadded}";
-                    // Don't log error here again, was logged on load attempt
-                }
-                // Otherwise keep status as "Idle" or "Stopped" or error message from loading
-                DA.SetData(0, null); DA.SetData(1, null); DA.SetData(2, null); DA.SetData(3, null); // Clear data outputs when stopped
-            }
-            // --- End Playback Logic ---
+            // --- End Playback Loop ---
 
-            // --- Set Final Outputs ---
-            DA.SetData(4, status);                 // Set Status output (Index 4)
-            DA.SetData(5, outputFrameNumber);      // Set FrameNumber output (Index 5)
-            DA.SetDataList(6, runtimeMessages);    // Set RuntimeLog output (Index 6)
-            // --- End Set Final Outputs ---
+
+            // --- Determine final status if not running ---
+            if (!isRunning && !loadTriggered) // Update status if idle/stopped/finished and not just loaded
+            {
+                outputFrameNumber = -1;
+                if (status == "Idle")
+                { // Only update if truly idle, not stopped/finished
+                    if (File.Exists(targetFilePath) && logData.Count > 0 && lastCalculatedFrameIndex >= 0) status = "Ready (Frame 0 loaded)";
+                    else if (File.Exists(targetFilePath) && logData.Count > 0 && lastCalculatedFrameIndex < 0) status = "Ready (Data loaded, press Load)";
+                    else if (File.Exists(targetFilePath) && logData.Count == 0) status = "Ready (No data points)";
+                    else if (!File.Exists(targetFilePath)) status = $"Log file not found: {runNumberPadded}";
+                }
+                // Keep status if "Stopped", "Finished", or Error
+            }
+            // --- End Status Update ---
+
+
+            // --- Set Outputs ---
+            DA.SetData(0, status);
+            DA.SetData(1, outputFrameNumber);
+            // Header Data
+            DA.SetData(2, recordedWorldTransform);
+            DA.SetData(3, recordedTCPOffset);
+            // Camera Data
+            DA.SetData(4, recordedCamLocation);
+            DA.SetData(5, recordedCamTarget);
+            DA.SetData(6, recordedLensLength);
+            DA.SetData(7, recordedCamUp);
+            // Calculated Outputs (from cache)
+            DA.SetData(8, lastCalculatedDevicePlane);
+            DA.SetData(9, lastCalculatedWorldPlane);
+            DA.SetData(10, lastCalculatedTotalForce);
+            // Log
+            DA.SetDataList(11, runtimeMessages);
+            // --- End Set Outputs ---
         }
 
 
         /// <summary>
-        /// Loads the specified log file, parses headers (including WorldTransform), and data.
-        /// Uses LogAndAddMessage for warnings/errors.
+        /// Calculates Device/World planes and Total Force for a specific frame index.
+        /// </summary>
+        private bool CalculatePlanesAndForce(int frameIndex, Vector3d tcpOffsetToApply, Transform worldTransformToApply, out Plane devicePlane, out Plane worldPlane, out Vector3d totalForce)
+        {
+            devicePlane = Plane.Unset;
+            worldPlane = Plane.Unset;
+            totalForce = Vector3d.Zero; // Default force output
+
+            if (logData == null || frameIndex < 0 || frameIndex >= logData.Count) return false;
+
+            ReplayFrameData entry = logData[frameIndex];
+            if (entry.TransformMatrix == null || entry.TransformMatrix.Length != 16) return false;
+            if (entry.TotalForce == null || entry.TotalForce.Length != 3) return false; // Check force array
+
+            try
+            {
+                // 1. Calculate Base Device Plane
+                var origin = new Point3d(-entry.TransformMatrix[12], entry.TransformMatrix[14], entry.TransformMatrix[13]);
+                var xDirection = new Vector3d(-entry.TransformMatrix[0], entry.TransformMatrix[2], entry.TransformMatrix[1]);
+                var yDirection = new Vector3d(-entry.TransformMatrix[4], entry.TransformMatrix[6], entry.TransformMatrix[5]);
+                Plane baseDevicePlane = new Plane(origin, xDirection, yDirection);
+
+                // 2. Apply TCP Offset
+                devicePlane = baseDevicePlane;
+                if (!tcpOffsetToApply.IsZero)
+                {
+                    Vector3d baseZDirection = Vector3d.CrossProduct(baseDevicePlane.XAxis, baseDevicePlane.YAxis);
+                    Vector3d offsetInPlaneSpace = tcpOffsetToApply.X * baseDevicePlane.XAxis + tcpOffsetToApply.Y * baseDevicePlane.YAxis + tcpOffsetToApply.Z * baseZDirection;
+                    devicePlane.Origin += offsetInPlaneSpace;
+                }
+
+                // 3. Calculate World Plane
+                worldPlane = devicePlane;
+                if (!worldTransformToApply.Equals(Transform.Identity))
+                {
+                    worldPlane.Transform(worldTransformToApply);
+                }
+
+                // 4. Convert Recorded Force (Device Coordinates) to Rhino Vector
+                totalForce = new Vector3d(-entry.TotalForce[0], entry.TotalForce[2], entry.TotalForce[1]);
+
+                return true; // Success
+            }
+            catch (Exception ex)
+            {
+                LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Exception calculating planes/force for log index {frameIndex}: {ex.Message}");
+                devicePlane = Plane.Unset; worldPlane = Plane.Unset; totalForce = Vector3d.Zero;
+                return false; // Indicate failure
+            }
+        }
+
+
+
+        /// <summary>
+        /// Resets playback state variables (clears data, resets headers, frame count).
+        /// </summary>
+        private void ResetPlaybackState()
+        {
+            logData.Clear();
+            recordedWorldTransform = Transform.Identity;
+            recordedTCPOffset = Vector3d.Zero;
+            recordedCamLocation = Point3d.Origin;
+            recordedCamTarget = Point3d.Origin;
+            recordedLensLength = 50.0;
+            recordedCamUp = Vector3d.ZAxis;
+            startTimeUs = 0;
+            endTimeUs = 0;
+            currentFrameNumber = -1;
+        }
+
+
+        /// <summary>
+        /// Loads the specified log file, parses headers (Camera, Transform, TCP), and data.
+        /// Uses LogAndAddMessage for feedback. Returns status string.
         /// </summary>
         private string LoadLogFile(string filePath, CultureInfo culture)
         {
-            logData.Clear(); startTimeUs = 0; endTimeUs = 0; currentFilePath = ""; // Reset state related to file
-            recordedWorldTransform = Transform.Identity; // Reset transform for each load attempt
-            bool transformValuesFound = false; // Track if transform was successfully parsed
+            ResetPlaybackState(); // Clear previous data before loading
+
+            bool foundWorldTransformHeader = false; bool foundWorldTransformValues = false;
+            bool foundTcpOffsetHeader = false; bool foundTcpOffsetValues = false;
+            bool foundCamLocation = false, foundCamTarget = false, foundLensLength = false, foundCamUp = false;
+            bool foundDataHeader = false;
 
             if (!File.Exists(filePath))
             {
                 LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"File not found: {filePath}");
-                return $"Error: File not found."; // Return error status
+                return $"Error: File not found."; // Ensure return
             }
 
             try
             {
                 using (StreamReader reader = new StreamReader(filePath))
                 {
-                    string line; int lineNum = 0; bool transformHeaderFound = false;
-                    bool foundDataHeader = false; // Track if the data header row is found
+                    string line; int lineNum = 0;
                     while ((line = reader.ReadLine()) != null)
                     {
                         lineNum++; line = line.Trim();
-                        if (string.IsNullOrEmpty(line)) continue; // Skip empty lines
+                        if (string.IsNullOrEmpty(line)) continue;
 
                         if (line.StartsWith("#"))
-                        {
-                            // Process Header Lines
-                            if (line.StartsWith("#WorldTransform:"))
-                            {
-                                transformHeaderFound = true; // Mark that we found the transform definition line
-                            }
-                            // Check for specific data header to ensure format compatibility
-                            else if (line.StartsWith("#time_us,device_pos_x"))
-                            {
-                                foundDataHeader = true;
-                            }
-                            // Skip other comment lines (like recording start time)
-                            continue; // Move to next line
+                        { // --- Parse Header Lines ---
+                            line = line.Substring(1).Trim();
+                            if (line.StartsWith("WorldTransform")) foundWorldTransformHeader = true;
+                            else if (line.StartsWith("TCPOffset")) foundTcpOffsetHeader = true;
+                            else if (line.StartsWith("Data Columns:")) foundDataHeader = true;
+                            else if (line.StartsWith("CamLocation:")) ParsePoint3DHeader(line, "CamLocation", ref recordedCamLocation, ref foundCamLocation, lineNum);
+                            else if (line.StartsWith("CamTarget:")) ParsePoint3DHeader(line, "CamTarget", ref recordedCamTarget, ref foundCamTarget, lineNum);
+                            else if (line.StartsWith("LensLength:")) ParseDoubleHeader(line, "LensLength", ref recordedLensLength, ref foundLensLength, lineNum, culture);
+                            else if (line.StartsWith("CamUp:")) ParseVector3DHeader(line, "CamUp", ref recordedCamUp, ref foundCamUp, lineNum, culture);
+                            continue; // Skip to next line after processing header line
                         }
-                        else if (transformHeaderFound) // Check if this non-comment line is the transform data
-                        {
-                            transformHeaderFound = false; // Consume this flag, only expect data on the line immediately after header
-                            // This line *should* be the transform values
-                            string[] matrixValues = line.Split(',');
-                            if (matrixValues.Length == 16)
-                            {
-                                double[] m = new double[16]; bool parseOk = true;
-                                for (int i = 0; i < 16; i++)
-                                {
-                                    // Try parsing each matrix element
-                                    if (!double.TryParse(matrixValues[i], NumberStyles.Float | NumberStyles.AllowExponent, culture, out m[i])) // Allow scientific notation
-                                    {
-                                        parseOk = false;
-                                        LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed to parse transform value '{matrixValues[i]}' at index {i} on line {lineNum}.");
-                                        break; // Stop parsing this line
-                                    }
-                                }
-                                if (parseOk)
-                                {
-                                    // Construct Transform object correctly
-                                    recordedWorldTransform = new Transform(); // Start fresh
-                                    recordedWorldTransform.M00 = m[0]; recordedWorldTransform.M01 = m[1]; recordedWorldTransform.M02 = m[2]; recordedWorldTransform.M03 = m[3];
-                                    recordedWorldTransform.M10 = m[4]; recordedWorldTransform.M11 = m[5]; recordedWorldTransform.M12 = m[6]; recordedWorldTransform.M13 = m[7];
-                                    recordedWorldTransform.M20 = m[8]; recordedWorldTransform.M21 = m[9]; recordedWorldTransform.M22 = m[10]; recordedWorldTransform.M23 = m[11];
-                                    recordedWorldTransform.M30 = m[12]; recordedWorldTransform.M31 = m[13]; recordedWorldTransform.M32 = m[14]; recordedWorldTransform.M33 = m[15];
-                                    transformValuesFound = true; // Mark success
-                                    LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Parsed WorldTransform from log file.");
-                                }
-                                else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "Failed to parse all WorldTransform values from log."); }
-                            }
-                            else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"WorldTransform value line {lineNum} has incorrect number of values ({matrixValues.Length}). Expected 16."); }
-                            // Continue to next line after processing potential transform data
+                        else if (foundWorldTransformHeader && !foundWorldTransformValues)
+                        { // --- Parse World Transform Values ---
+                            if (ParseTransformValues(line, ref recordedWorldTransform, lineNum, culture)) foundWorldTransformValues = true;
+                            foundWorldTransformHeader = false; // Consume flag regardless of success
                             continue;
                         }
-
-                        // --- Parse Data Line ---
-                        // Only parse if it doesn't start with # and isn't the transform line we just handled
-                        string[] values = line.Split(',');
-                        if (values.Length >= 7)
-                        {
-                            if (long.TryParse(values[0], out long timeUs) &&
-                                double.TryParse(values[1], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double posX) &&
-                                double.TryParse(values[2], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double posY) &&
-                                double.TryParse(values[3], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double posZ) &&
-                                double.TryParse(values[4], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double forceX) &&
-                                double.TryParse(values[5], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double forceY) &&
-                                double.TryParse(values[6], NumberStyles.Float | NumberStyles.AllowExponent, culture, out double forceZ))
-                            {
-                                logData.Add(new ReplayEntry_ghohReplay
-                                {
-                                    TimeMicroseconds = timeUs,
-                                    DevicePosition = new Point3d(posX, posY, posZ),
-                                    DeviceForce = new Vector3d(forceX, forceY, forceZ)
-                                });
-                            }
-                            else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed parse numeric data line {lineNum}. Skipping."); }
+                        else if (foundTcpOffsetHeader && !foundTcpOffsetValues)
+                        { // --- Parse TCP Offset Values ---
+                            if (ParseVector3DValues(line, ref recordedTCPOffset, lineNum, culture)) foundTcpOffsetValues = true;
+                            foundTcpOffsetHeader = false; // Consume flag regardless of success
+                            continue;
                         }
-                        else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Incorrect data values ({values.Length}) on line {lineNum}. Expected >= 7. Skipping."); }
-                        // --- End Parse Data Line ---
+                        else
+                        { // --- Parse Main Data Line ---
+                            string[] values = line.Split(',');
+                            if (values.Length >= 20)
+                            {
+                                if (long.TryParse(values[0], NumberStyles.Any, culture, out long timeUs))
+                                {
+                                    double[] transformMatrix = new double[16]; double[] totalForce = new double[3]; bool parseOk = true;
+                                    // Parse Transform Matrix
+                                    for (int i = 0; i < 16; i++) { if (!double.TryParse(values[i + 1].Trim(), NumberStyles.Any, culture, out transformMatrix[i])) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed parse transform value #{i} ('{values[i + 1]}') on data line {lineNum}. Skipping."); parseOk = false; break; } }
+                                    if (!parseOk) continue;
+                                    // Parse Total Force
+                                    for (int i = 0; i < 3; i++) { if (!double.TryParse(values[i + 17].Trim(), NumberStyles.Any, culture, out totalForce[i])) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed parse force value #{i} ('{values[i + 17]}') on data line {lineNum}. Skipping."); parseOk = false; break; } }
+                                    if (!parseOk) continue;
+                                    // Add entry if all parsed OK
+                                    logData.Add(new ReplayFrameData(timeUs, transformMatrix, totalForce));
+                                }
+                                else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed parse timestamp on data line {lineNum}. Skipping."); }
+                            }
+                            else { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Incorrect data values ({values.Length}) on line {lineNum}. Expected >= 20. Skipping."); }
+                        }
                     } // End While Loop
-                    if (!foundDataHeader && logData.Count > 0)
-                    {
-                        LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "Data header line ('#time_us,device_pos_x...') not found. File format might be incompatible.");
-                    }
-                    else if (!foundDataHeader && logData.Count == 0)
-                    {
-                        LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "Data header line not found and no data parsed.");
-                    }
                 } // End Using Reader
 
-                // Set start/end times after loading all data
+                // --- Post-Load Checks and Setup ---
+                if (!foundDataHeader) LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "Data header line ('#Data Columns:...') not found.");
+                if (!foundWorldTransformValues) LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "WorldTransform values not found/parsed.");
+                if (!foundTcpOffsetValues) LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "TCPOffset values not found/parsed.");
+                if (!(foundCamLocation && foundCamTarget && foundLensLength && foundCamUp)) LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "One or more Camera header values not found/parsed.");
+
                 if (logData.Count > 0)
                 {
-                    // Ensure data is sorted by timestamp (it should be, but safety check)
                     logData = logData.OrderBy(e => e.TimeMicroseconds).ToList();
                     startTimeUs = logData[0].TimeMicroseconds;
                     endTimeUs = logData[logData.Count - 1].TimeMicroseconds;
-                    // Adjust start time to be relative to zero? No, keep original timestamps.
-                    // The calculation `targetTimeUs = startTimeUs + ...` handles the offset.
+                    double logDurationUs = endTimeUs - startTimeUs;
+                    LogAndAddMessage(GH_RuntimeMessageLevel.Remark, $"Total log duration: {logDurationUs / 1000000.0:F3} seconds ({logData.Count} entries).");
+                    return $"OK: Loaded {logData.Count} data points."; // Return success
                 }
                 else
                 {
-                    LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "No valid data points loaded from file.");
+                    LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "No valid data points loaded.");
+                    return "Warning: No data points loaded."; // Return warning
                 }
-                // Report if transform wasn't found/parsed
-                if (!transformValuesFound) { LogAndAddMessage(GH_RuntimeMessageLevel.Warning, "WorldTransform not found or parsed from log file header. Using Identity transform."); }
-
-                // Store path only if loading finished without critical file access error
-                // currentFilePath = filePath; // Set in caller only on success
-                return $"OK: Loaded {logData.Count} data points.";
             }
             catch (IOException ioEx)
             {
-                logData.Clear(); // Ensure data is cleared on error
-                LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Error reading file (I/O): {ioEx.Message}");
-                return $"Error loading file (I/O): {ioEx.Message}";
+                ResetPlaybackState(); LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Error reading file (I/O): {ioEx.Message}");
+                return $"Error loading file (I/O)."; // Return error
             }
             catch (Exception ex)
             {
-                logData.Clear(); // Ensure data is cleared on error
-                LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Error loading file (General): {ex.Message}");
-                return $"Error loading file (General): {ex.Message}";
+                ResetPlaybackState(); LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Error loading file (General): {ex.Message}");
+                return $"Error loading file (General)."; // Return error
             }
-        }
-        // --- End LoadLogFile ---
+        } // --- End LoadLogFile ---
 
 
         /// <summary>
-        /// Finds the index of the log entry closest to the target time using a linear scan.
-        /// Assumes logData is sorted by TimeMicroseconds.
-        /// Returns -1 if data is empty.
+        /// Calculates Device and World planes for a specific frame index from loaded log data.
+        /// </summary>
+        private bool CalculatePlanesForFrame(int frameIndex, Vector3d tcpOffsetToApply, Transform worldTransformToApply, out Plane devicePlane, out Plane worldPlane)
+        {
+            devicePlane = Plane.Unset;
+            worldPlane = Plane.Unset;
+
+            if (logData == null || frameIndex < 0 || frameIndex >= logData.Count) { return false; }
+
+            ReplayFrameData entry = logData[frameIndex];
+            if (entry.TransformMatrix == null || entry.TransformMatrix.Length != 16) { return false; }
+
+            try
+            {
+                var origin = new Point3d(-entry.TransformMatrix[12], entry.TransformMatrix[14], entry.TransformMatrix[13]);
+                var xDirection = new Vector3d(-entry.TransformMatrix[0], entry.TransformMatrix[2], entry.TransformMatrix[1]);
+                var yDirection = new Vector3d(-entry.TransformMatrix[4], entry.TransformMatrix[6], entry.TransformMatrix[5]);
+                Plane baseDevicePlane = new Plane(origin, xDirection, yDirection);
+
+                devicePlane = baseDevicePlane; // Start with base
+                if (!tcpOffsetToApply.IsZero)
+                {
+                    Vector3d baseZDirection = Vector3d.CrossProduct(baseDevicePlane.XAxis, baseDevicePlane.YAxis);
+                    Vector3d offsetInPlaneSpace = tcpOffsetToApply.X * baseDevicePlane.XAxis + tcpOffsetToApply.Y * baseDevicePlane.YAxis + tcpOffsetToApply.Z * baseZDirection;
+                    devicePlane.Origin += offsetInPlaneSpace;
+                }
+
+                worldPlane = devicePlane; // Start with TCP-adjusted plane
+                if (!worldTransformToApply.Equals(Transform.Identity))
+                {
+                    worldPlane.Transform(worldTransformToApply);
+                }
+                return true; // Success
+            }
+            catch (Exception ex)
+            {
+                LogAndAddMessage(GH_RuntimeMessageLevel.Error, $"Exception calculating planes for log index {frameIndex}: {ex.Message}");
+                devicePlane = Plane.Unset; worldPlane = Plane.Unset;
+                return false; // Indicate failure
+            }
+        }
+
+
+        // --- Header Parsing Helpers (Ensure return values for bool methods) ---
+        private bool ParsePoint3DHeader(string line, string expectedPrefix, ref Point3d targetPoint, ref bool foundFlag, int lineNum)
+        {
+            if (!line.StartsWith(expectedPrefix + ":")) return false; // Return false if prefix mismatch
+            string valuePart = line.Substring(expectedPrefix.Length + 1).Trim();
+            string[] parts = valuePart.Split(',');
+            if (parts.Length == 3 &&
+                double.TryParse(parts[0], NumberStyles.Any, CultureInfo.InvariantCulture, out double x) &&
+                double.TryParse(parts[1], NumberStyles.Any, CultureInfo.InvariantCulture, out double y) &&
+                double.TryParse(parts[2], NumberStyles.Any, CultureInfo.InvariantCulture, out double z))
+            {
+                targetPoint = new Point3d(x, y, z); foundFlag = true; return true; // Return true on success
+            }
+            LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed to parse '{expectedPrefix}' values on line {lineNum}. Found: '{valuePart}'");
+            return false; // Return false on failure
+        }
+
+        private bool ParseVector3DHeader(string line, string expectedPrefix, ref Vector3d targetVector, ref bool foundFlag, int lineNum, CultureInfo culture)
+        {
+            if (!line.StartsWith(expectedPrefix + ":")) return false; // Return false
+            string valuePart = line.Substring(expectedPrefix.Length + 1).Trim();
+            string[] parts = valuePart.Split(',');
+            if (parts.Length == 3 &&
+                double.TryParse(parts[0], NumberStyles.Any, culture, out double x) &&
+                double.TryParse(parts[1], NumberStyles.Any, culture, out double y) &&
+                double.TryParse(parts[2], NumberStyles.Any, culture, out double z))
+            {
+                targetVector = new Vector3d(x, y, z); foundFlag = true; return true; // Return true
+            }
+            LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed to parse '{expectedPrefix}' values on line {lineNum}. Found: '{valuePart}'");
+            return false; // Return false
+        }
+
+        private bool ParseDoubleHeader(string line, string expectedPrefix, ref double targetDouble, ref bool foundFlag, int lineNum, CultureInfo culture)
+        {
+            if (!line.StartsWith(expectedPrefix + ":")) return false; // Return false
+            string valuePart = line.Substring(expectedPrefix.Length + 1).Trim();
+            if (double.TryParse(valuePart, NumberStyles.Any, culture, out double val))
+            {
+                targetDouble = val; foundFlag = true; return true; // Return true
+            }
+            LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed to parse '{expectedPrefix}' value on line {lineNum}. Found: '{valuePart}'");
+            return false; // Return false
+        }
+
+        private bool ParseTransformValues(string line, ref Transform targetTransform, int lineNum, CultureInfo culture)
+        {
+            string[] matrixValues = line.Split(',');
+            if (matrixValues.Length == 16)
+            {
+                double[] m = new double[16];
+                for (int i = 0; i < 16; i++)
+                {
+                    if (!double.TryParse(matrixValues[i].Trim(), NumberStyles.Any, culture, out m[i]))
+                    {
+                        LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"Failed parse WorldTransform value '{matrixValues[i]}' at index {i} on line {lineNum}.");
+                        return false; // Return false
+                    }
+                }
+                targetTransform = new Transform();
+                targetTransform.M00 = m[0]; targetTransform.M01 = m[1]; targetTransform.M02 = m[2]; targetTransform.M03 = m[3];
+                targetTransform.M10 = m[4]; targetTransform.M11 = m[5]; targetTransform.M12 = m[6]; targetTransform.M13 = m[7];
+                targetTransform.M20 = m[8]; targetTransform.M21 = m[9]; targetTransform.M22 = m[10]; targetTransform.M23 = m[11];
+                targetTransform.M30 = m[12]; targetTransform.M31 = m[13]; targetTransform.M32 = m[14]; targetTransform.M33 = m[15];
+                LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Parsed WorldTransform values from log file.");
+                return true; // Return true
+            }
+            LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"WorldTransform value line {lineNum} has incorrect number of values ({matrixValues.Length}). Expected 16.");
+            return false; // Return false
+        }
+
+        private bool ParseVector3DValues(string line, ref Vector3d targetVector, int lineNum, CultureInfo culture)
+        {
+            string[] parts = line.Split(',');
+            if (parts.Length == 3 &&
+                double.TryParse(parts[0].Trim(), NumberStyles.Any, culture, out double x) &&
+                double.TryParse(parts[1].Trim(), NumberStyles.Any, culture, out double y) &&
+                double.TryParse(parts[2].Trim(), NumberStyles.Any, culture, out double z))
+            {
+                targetVector = new Vector3d(x, y, z);
+                LogAndAddMessage(GH_RuntimeMessageLevel.Remark, "Parsed TCPOffset values from log file.");
+                return true; // Return true
+            }
+            LogAndAddMessage(GH_RuntimeMessageLevel.Warning, $"TCPOffset value line {lineNum} has incorrect number of values ({parts.Length}). Expected 3.");
+            return false; // Return false
+        }
+
+        /// <summary>
+        /// Finds the index of the log entry closest to the target time using a binary search approach.
+        /// Assumes logData is sorted by TimeMicroseconds. Returns -1 if data is empty.
         /// </summary>
         private int FindClosestEntryIndex(double targetTimeUs)
         {
-            if (logData == null || logData.Count == 0) return -1;
-            if (logData.Count == 1) return 0; // Only one entry
+            if (logData == null || logData.Count == 0) return -1; // Return -1
 
-            // Optimization: If target time is before the first entry or after the last
-            if (targetTimeUs <= logData[0].TimeMicroseconds) return 0;
-            if (targetTimeUs >= logData[logData.Count - 1].TimeMicroseconds) return logData.Count - 1;
+            int low = 0;
+            int high = logData.Count - 1;
 
-            // Binary search would be faster for large logs, but linear scan is simpler
-            // and likely sufficient unless logs are extremely long. Let's keep linear for now.
-            int bestIndex = 0;
-            double minDiff = double.MaxValue;
+            // Handle edge cases: target time before first or after last entry
+            if (targetTimeUs <= logData[low].TimeMicroseconds) return low; // Return 0
+            if (targetTimeUs >= logData[high].TimeMicroseconds) return high; // Return last index
 
-            // Simple linear scan
-            for (int i = 0; i < logData.Count; i++)
+            int closestIndex = low; // Initialize closest index
+
+            while (low <= high)
             {
-                double diff = Math.Abs(logData[i].TimeMicroseconds - targetTimeUs);
-                if (diff < minDiff)
+                int mid = low + (high - low) / 2;
+                // Prevent accessing invalid index if mid becomes equal to logData.Count
+                if (mid >= logData.Count)
                 {
-                    minDiff = diff;
-                    bestIndex = i;
+                    high = logData.Count - 1; // Adjust high bound and try again or exit loop
+                    continue;
                 }
-                // Optimization: Since data is sorted, if we pass the target time
-                // and the difference starts increasing, we've found the minimum.
-                // However, need to handle edge cases carefully. Let's stick to full scan for robustness.
-                // Alternative: Find the first entry *greater than* targetTimeUs,
-                // then compare its difference and the previous entry's difference.
 
-                // Optimization based on sorted data:
-                if (logData[i].TimeMicroseconds > targetTimeUs)
+                long midTime = logData[mid].TimeMicroseconds;
+
+                // Check difference with mid and update closestIndex if mid is closer
+                // Use long for difference calculation to avoid potential double precision issues with large timestamps
+                if (Math.Abs(midTime - targetTimeUs) < Math.Abs(logData[closestIndex].TimeMicroseconds - targetTimeUs))
                 {
-                    // We just passed the target time. Compare current index i and previous index i-1
-                    if (i > 0)
-                    {
-                        double diffPrev = Math.Abs(logData[i - 1].TimeMicroseconds - targetTimeUs);
-                        if (diffPrev < diff)
-                        {
-                            return i - 1; // Previous index was closer
-                        }
-                    }
-                    return i; // Current index is closer or it's the first element
+                    closestIndex = mid;
+                }
+
+                if (midTime < targetTimeUs)
+                {
+                    low = mid + 1;
+                }
+                else if (midTime > targetTimeUs)
+                {
+                    high = mid - 1;
+                }
+                else
+                { // Exact match found
+                    return mid; // Return exact match index
                 }
             }
-            // Should theoretically be covered by the end-check or the loop optimization,
-            // but return the last index if loop completes somehow (e.g., targetTimeUs matches last entry exactly)
-            return logData.Count - 1;
-        }
 
+            // After loop, check neighbors of 'closestIndex' found during search
+            int bestIndex = closestIndex;
+            // Use long for difference calculation
+            long minDiff = Math.Abs(logData[bestIndex].TimeMicroseconds - (long)targetTimeUs);
 
-        /// <summary>
-        /// Calculates the average force vector over a window centered around closestIndex.
-        /// </summary>
-        private Vector3d CalculateAverageForce(int closestIndex, int subsampleFactor)
-        {
-            // If no subsampling or invalid index/data, return the force at the closest index
-            if (subsampleFactor <= 1 || logData == null || logData.Count == 0 || closestIndex < 0 || closestIndex >= logData.Count)
-            {
-                return (logData != null && closestIndex >= 0 && closestIndex < logData.Count)
-                       ? logData[closestIndex].DeviceForce : Vector3d.Zero;
+            if (closestIndex > 0)
+            { // Check index before
+                long diffPrev = Math.Abs(logData[closestIndex - 1].TimeMicroseconds - (long)targetTimeUs);
+                if (diffPrev < minDiff)
+                {
+                    minDiff = diffPrev; bestIndex = closestIndex - 1;
+                }
+            }
+            if (closestIndex < logData.Count - 1)
+            { // Check index after
+                long diffNext = Math.Abs(logData[closestIndex + 1].TimeMicroseconds - (long)targetTimeUs);
+                if (diffNext < minDiff)
+                {
+                    bestIndex = closestIndex + 1;
+                }
             }
 
-            // Determine window boundaries, centered around closestIndex
-            int halfWindow = (subsampleFactor - 1) / 2;
-            int startIndex = Math.Max(0, closestIndex - halfWindow);
-            // Calculate end index based on start + factor, capped by data count
-            // End index is exclusive in loops, so aim for startIndex + subsampleFactor
-            int endIndexExclusive = Math.Min(logData.Count, startIndex + subsampleFactor);
-            // Recalculate start index to ensure window size near the end, if end got capped
-            // Ensure we don't go below 0 if the window size is large
-            startIndex = Math.Max(0, endIndexExclusive - subsampleFactor);
-
-            double sumX = 0, sumY = 0, sumZ = 0;
-            int count = 0;
-
-            for (int i = startIndex; i < endIndexExclusive; i++) // Use < endIndexExclusive
-            {
-                sumX += logData[i].DeviceForce.X;
-                sumY += logData[i].DeviceForce.Y;
-                sumZ += logData[i].DeviceForce.Z;
-                count++;
-            }
-
-            // Return average or Zero if count is somehow zero (shouldn't happen if logic is correct)
-            return (count > 0) ? new Vector3d(sumX / count, sumY / count, sumZ / count) : Vector3d.Zero;
+            return bestIndex; // Return the index with the absolute minimum difference
         }
+        // --- End Helper Methods ---
 
+        protected override System.Drawing.Bitmap Icon => null;
+        public override Guid ComponentGuid => new Guid("3E9F0C4A-1D7A-4F8C-B2E1-8D4A1B5E9C1F");
+        public override GH_Exposure Exposure => GH_Exposure.primary;
 
-        protected override System.Drawing.Bitmap Icon => null; // Provide an icon if desired
-        public override Guid ComponentGuid => new Guid("3E9F0C4A-1D7A-4F8C-B2E1-8D4A1B5E9C1F"); // Keep existing GUID
-    }
-}
+    } // End Class
+} // End Namespace
