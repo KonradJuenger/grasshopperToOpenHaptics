@@ -1,18 +1,15 @@
 ﻿using System;
 using System.Diagnostics;
-using Rhino.Geometry; // Assuming Curve is Rhino.Geometry.Curve
-using System.Collections.Generic; // Required for List
-
-// Ensure HDdll and UCManager are accessible via correct using statements if not in this namespace.
-// using YourOpenHapticsWrapperNamespace; // For HDdll
-// using YourMicrocontrollerWrapperNamespace; // For UCManager
+using Rhino.Geometry;
+using System.Collections.Generic;
+using System.Linq; // For .ToList()
 
 namespace ghoh
 {
     public static class ForceManager
     {
         // General state
-        private static double[] currentTotalForce = new double[3]; // Stores the last calculated total force for external query.
+        private static double[] currentTotalForce = new double[3];
 
         // Direct force parameters
         private static bool directForceEnabled;
@@ -20,7 +17,7 @@ namespace ghoh
 
         // Filtered force support (UKF)
         private static bool filteredForceEnabled;
-        private static UKF forceFilter; // Unscented Kalman Filter for smoothing forces.
+        private static UKF forceFilter;
         private static double[] lastFilteredForce = new double[3];
         private static double processNoise = 0.05;
         private static double measurementNoise = 0.3;
@@ -28,14 +25,25 @@ namespace ghoh
         // Tool Center Point (TCP) Offset
         private static DeviceManager.Vector3D tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
 
-        // Pull to point parameters
-        private static bool pullToPointEnabled;
-        private static DeviceManager.Vector3D targetPoint;
-        private static DeviceManager.Vector3D currentSmoothedTarget;
-        private static double maxForceValuePoint = 1.0;
-        private static double maxDistanceValuePoint = 1.0;
-        private static bool interpolationEnabled;
-        private static double maxStepSize = 5.0;
+        // --- Old Single Pull to point parameters (Commented out / To be removed) ---
+        // private static bool pullToPointEnabled; 
+        // private static DeviceManager.Vector3D targetPoint;
+        // private static DeviceManager.Vector3D currentSmoothedTarget;
+        // private static double maxForceValuePoint = 1.0;
+        // private static double maxDistanceValuePoint = 1.0;
+        // private static bool interpolationEnabled; // Equivalent to smoothingEnabledMultiPoint
+        // private static double maxStepSize = 5.0; // Equivalent to maxStepMultiPoint
+
+        // --- New Multi Pull to point parameters ---
+        private static bool multiPullToPointEnabled;
+        private static List<DeviceManager.Vector3D> currentTargetPoints_RhinoCoords = new List<DeviceManager.Vector3D>();
+        private static List<DeviceManager.Vector3D> currentSmoothedTargetPoints_RhinoCoords = new List<DeviceManager.Vector3D>();
+        private static double maxForceValueMultiPoint = 1.0;
+        private static double maxDistanceValueMultiPoint = 1.0;
+        private static double falloffDistanceMultiPoint = 0.0; // New
+        private static bool smoothingEnabledMultiPoint;
+        private static double maxStepMultiPoint = 5.0;
+
 
         // Pull to plane parameters
         private static bool pullToPlaneEnabled;
@@ -81,7 +89,7 @@ namespace ghoh
         private static DeviceManager.Vector3D vibrationCurveDirection = new DeviceManager.Vector3D(0, 0, 1);
         private static double vibrationCurveDeadzone = 0.0;
         private static double vibrationCurveMaxDistance = 10.0;
-        private static double vibrationCurveMaxAmplitude = 1.0; // Max amplitude for curve vibration.
+        private static double vibrationCurveMaxAmplitude = 1.0;
         private static double vibrationCurveFrequency = 100.0;
         private static bool vibrationCurveInvertMapping = false;
         private static bool vibrationCurveUseSquareWave = false;
@@ -95,49 +103,39 @@ namespace ghoh
         private static Curve pullToCurve = null;
         private static double maxForceValueCurve = 1.0;
         private static double maxDistanceValueCurve = 1.0;
+        private static double pullCurveFalloffDistance = 0.0;
         private static bool pullCurveFade = false;
         private static int pullCurveMethod = 0;
         private static bool pullAlongEnabled = false;
         private static double travelingPointSpeed = 10.0;
-        private static double travelingPointPosition = 0.0;
         private static double travelingPointLengthPosition = 0.0;
         private static DateTime lastTravelingPointUpdateTime = DateTime.Now;
         private static bool travelingPointActive = false;
         private static double totalCurveLength = 0.0;
         private static double tangentForce = 1.0;
-        private static Curve originalPullToCurve = null;
-        private static double originalCurveLength = 0.0;
 
         // Vibration Point Handling (Multiple Points)
         private struct VibrationPointData
         {
             public DeviceManager.Vector3D Target;
-            public DeviceManager.Vector3D Direction; // Normalized vibration direction in device orientation space.
+            public DeviceManager.Vector3D Direction;
             public double Deadzone;
             public double MaxDistance;
-            public double MaxAmplitude; // Max amplitude this single point can contribute (set by global param).
+            public double MaxAmplitude;
             public double Frequency;
             public bool InvertMapping;
             public bool UseSquareWave;
         }
         private static List<VibrationPointData> activeVibrationPoints = new List<VibrationPointData>();
         private static bool globalVibrationPointEnabled = false;
-        // Stores the overall maximum amplitude for the combined point vibrations, set by SetVibratePoints.
-        private static double currentOverallMaxVibrationAmplitude = 3.0; // Default cap, typically overridden.
+        private static double currentOverallMaxVibrationAmplitude = 3.0;
 
 
-        /// <summary>
-        /// Retrieves a copy of the last calculated total force vector.
-        /// </summary>
         public static double[] GetCurrentForce()
         {
             return (double[])currentTotalForce.Clone();
         }
 
-        /// <summary>
-        /// Configures viscous damping parameters.
-        /// </summary>
-        /// <returns>The last calculated viscous force vector (Rhino coordinates).</returns>
         public static Vector3d SetViscousDamping(bool enable, double gain, double maxForce, double deadbandThreshold = 10.0, double softness = 5.0, double filterCoefficient = 0.9, int windowSize = 10)
         {
             viscousDampingEnabled = enable;
@@ -150,9 +148,6 @@ namespace ghoh
             return new Vector3d(-lastViscousForce[0], lastViscousForce[2], lastViscousForce[1]);
         }
 
-        /// <summary>
-        /// Calculates the viscous force based on current device velocity and parameters.
-        /// </summary>
         private static double[] CalculateViscousForce()
         {
             if (viscousForceFilter == null)
@@ -222,18 +217,12 @@ namespace ghoh
             return finalForce;
         }
 
-        /// <summary>
-        /// Sets the Tool Center Point (TCP) offset from the device's gimbal point.
-        /// </summary>
         public static void SetTCPOffset(DeviceManager.Vector3D offset)
         {
             tcpOffset = offset;
         }
 
-        /// <summary>
-        /// Sets a direct force vector to be applied, optionally using a UKF filter.
-        /// </summary>
-        public static void SetDirectForce(double[] force, bool enable, bool useFilter = false)
+        public static void SetDirectForce(double[] force_deviceCoords, bool enable, bool useFilter = false)
         {
             if (useFilter)
             {
@@ -245,7 +234,7 @@ namespace ghoh
 
                 if (enable)
                 {
-                    forceFilter.Update(force);
+                    forceFilter.Update(force_deviceCoords);
                     lastFilteredForce = forceFilter.getState();
                 }
                 else
@@ -257,15 +246,12 @@ namespace ghoh
             }
             else
             {
-                currentDirectForce = force;
+                currentDirectForce = force_deviceCoords;
                 directForceEnabled = enable;
                 filteredForceEnabled = false;
             }
         }
 
-        /// <summary>
-        /// Sets parameters for the Unscented Kalman Filter (UKF) used with direct forces.
-        /// </summary>
         public static void SetFilterParams(double q, double r)
         {
             processNoise = Math.Max(0.001, Math.Min(q, 1.0));
@@ -276,9 +262,6 @@ namespace ghoh
             }
         }
 
-        /// <summary>
-        /// Configures damping parameters for forces.
-        /// </summary>
         public static void SetDampingParameters(bool enable, double coefficient, double derivativeCoefficient, DampingMethod method)
         {
             dampingEnabled = enable;
@@ -287,47 +270,48 @@ namespace ghoh
             currentDampingMethod = method;
         }
 
-        /// <summary>
-        /// Sets parameters for pulling the device towards a single point.
-        /// </summary>
-        public static void SetPullToPoint(DeviceManager.Vector3D target, bool enable, double maxForce, double maxDistance, bool useInterpolation = false, double stepSize = 5.0)
+        // --- Old SetPullToPoint (Single Point) - Commented out ---
+        /*
+        public static void SetPullToPoint(DeviceManager.Vector3D target_RhinoCoords, bool enable, double maxForce, double maxDistance, bool useInterpolation = false, double stepSize = 5.0)
         {
             if (!pullToPointEnabled && enable)
             {
-                currentSmoothedTarget = target;
+                currentSmoothedTarget = target_RhinoCoords;
             }
             pullToPointEnabled = enable;
-            targetPoint = target;
+            targetPoint = target_RhinoCoords;
             maxForceValuePoint = maxForce;
             maxDistanceValuePoint = maxDistance;
             interpolationEnabled = useInterpolation;
             maxStepSize = stepSize;
         }
+        */
 
-        /// <summary>
-        /// Calculates the force vector to pull the device towards the target point.
-        /// </summary>
-        private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos)
+        // --- Old CalculatePullToPointForce (Single Point) - Commented out ---
+        /*
+        private static double[] CalculatePullToPointForce(DeviceManager.Vector3D devicePos_RhinoCoords)
         {
-            var targetToUse = interpolationEnabled ? currentSmoothedTarget : targetPoint;
-            var dx = targetToUse.X - devicePos.X;
-            var dy = targetToUse.Y - devicePos.Y;
-            var dz = targetToUse.Z - devicePos.Z;
-            var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            var targetToUse_RhinoCoords = interpolationEnabled ? currentSmoothedTarget : targetPoint;
+            var dx_rhino = targetToUse_RhinoCoords.X - devicePos_RhinoCoords.X;
+            var dy_rhino = targetToUse_RhinoCoords.Y - devicePos_RhinoCoords.Y;
+            var dz_rhino = targetToUse_RhinoCoords.Z - devicePos_RhinoCoords.Z;
+            var distance = Math.Sqrt(dx_rhino * dx_rhino + dy_rhino * dy_rhino + dz_rhino * dz_rhino);
 
             if (distance < 0.001) return new double[] { 0, 0, 0 };
 
             var scale = distance > maxDistanceValuePoint ? maxForceValuePoint : maxForceValuePoint * (distance / maxDistanceValuePoint);
-            var fx = (dx / distance) * scale;
-            var fy = (dy / distance) * scale;
-            var fz = (dz / distance) * scale;
-            return new double[] { -fx, fz, fy }; // Rhino-like direction to Device Force components.
-        }
+            
+            var fx_rhino = (dx_rhino / distance) * scale;
+            var fy_rhino = (dy_rhino / distance) * scale;
+            var fz_rhino = (dz_rhino / distance) * scale;
 
-        /// <summary>
-        /// Updates the smoothed target position for interpolated pull-to-point.
-        /// </summary>
-        private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition)
+            return new double[] { -fx_rhino, fz_rhino, fy_rhino }; 
+        }
+        */
+
+        // --- Old UpdateSmoothedTarget (Single Point) - Commented out ---
+        /*
+        private static void UpdateSmoothedTarget(DeviceManager.Vector3D currentPosition_RhinoCoords)
         {
             if (!interpolationEnabled)
             {
@@ -349,28 +333,190 @@ namespace ghoh
                 currentSmoothedTarget.Z + dz * scaleFactor
             );
         }
+        */
 
-        /// <summary>
-        /// Sets parameters for pulling the device towards a plane.
-        /// </summary>
-        public static void SetPullToPlane(DeviceManager.Vector3D origin, DeviceManager.Vector3D normal, bool enable, double maxForce, double maxDistance)
+        // --- NEW Multi-Point Pull Methods ---
+        public static void SetMultiPullToPoints(
+            List<DeviceManager.Vector3D> targets_RhinoCoords,
+            bool enable,
+            double maxForce,
+            double maxDistance,
+            double falloffDist, // New parameter
+            bool useSmoothing,
+            double stepSize)
+        {
+            multiPullToPointEnabled = enable;
+            maxForceValueMultiPoint = Math.Max(0, maxForce);
+            maxDistanceValueMultiPoint = Math.Max(0.001, maxDistance);
+            falloffDistanceMultiPoint = Math.Max(0, falloffDist); // Store new parameter
+            smoothingEnabledMultiPoint = useSmoothing;
+            maxStepMultiPoint = Math.Max(0.1, stepSize);
+
+            if (!enable || targets_RhinoCoords == null || targets_RhinoCoords.Count == 0)
+            {
+                currentTargetPoints_RhinoCoords.Clear();
+                currentSmoothedTargetPoints_RhinoCoords.Clear();
+                return;
+            }
+
+            bool listStructureChanged = currentTargetPoints_RhinoCoords.Count != targets_RhinoCoords.Count;
+
+            // Always update raw targets with a copy
+            currentTargetPoints_RhinoCoords = new List<DeviceManager.Vector3D>(targets_RhinoCoords);
+
+            if (listStructureChanged || !smoothingEnabledMultiPoint)
+            {
+                // If list structure changed (e.g. point count) or smoothing is off,
+                // smoothed targets are just a direct copy of raw targets.
+                currentSmoothedTargetPoints_RhinoCoords = new List<DeviceManager.Vector3D>(currentTargetPoints_RhinoCoords);
+            }
+            else
+            {
+                // Smoothing is on, and point count is the same.
+                // We assume the order corresponds. The UpdateSmoothedTargets will handle moving them.
+                // If currentSmoothedTargetPoints_RhinoCoords was somehow desynced in count, fix it.
+                if (currentSmoothedTargetPoints_RhinoCoords.Count != currentTargetPoints_RhinoCoords.Count)
+                {
+                    currentSmoothedTargetPoints_RhinoCoords = new List<DeviceManager.Vector3D>(currentTargetPoints_RhinoCoords);
+                }
+                // Otherwise, existing smoothed points will be updated towards new raw targets in UpdateSmoothedTargets.
+            }
+        }
+
+        private static void UpdateSmoothedTargets()
+        {
+            if (!multiPullToPointEnabled || !smoothingEnabledMultiPoint ||
+                currentTargetPoints_RhinoCoords.Count == 0 ||
+                currentSmoothedTargetPoints_RhinoCoords.Count != currentTargetPoints_RhinoCoords.Count)
+            {
+                return;
+            }
+
+            for (int i = 0; i < currentTargetPoints_RhinoCoords.Count; i++)
+            {
+                DeviceManager.Vector3D rawTarget = currentTargetPoints_RhinoCoords[i];
+                DeviceManager.Vector3D smoothedTarget = currentSmoothedTargetPoints_RhinoCoords[i];
+
+                double dx = rawTarget.X - smoothedTarget.X;
+                double dy = rawTarget.Y - smoothedTarget.Y;
+                double dz = rawTarget.Z - smoothedTarget.Z;
+                double distanceToRawTarget = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (distanceToRawTarget < 0.001) // Effectively at the target
+                {
+                    if (!smoothedTarget.Equals(rawTarget)) // Only assign if different to avoid unnecessary list modification
+                        currentSmoothedTargetPoints_RhinoCoords[i] = rawTarget;
+                    continue;
+                }
+
+                double step = Math.Min(distanceToRawTarget, maxStepMultiPoint);
+                double scaleFactor = step / distanceToRawTarget;
+
+                currentSmoothedTargetPoints_RhinoCoords[i] = new DeviceManager.Vector3D(
+                    smoothedTarget.X + dx * scaleFactor,
+                    smoothedTarget.Y + dy * scaleFactor,
+                    smoothedTarget.Z + dz * scaleFactor
+                );
+            }
+        }
+
+        private static double[] CalculateMultiPullToPointForce(DeviceManager.Vector3D devicePos_RhinoCoords)
+        {
+            if (!multiPullToPointEnabled || currentTargetPoints_RhinoCoords.Count == 0)
+            {
+                return new double[] { 0, 0, 0 };
+            }
+
+            double strongestForceMag = -1.0; // Use -1 to ensure any positive force is chosen first
+            Vector3d dominantForceVec_Rhino = Vector3d.Zero;
+
+            List<DeviceManager.Vector3D> pointsToConsider = (smoothingEnabledMultiPoint &&
+                                                              currentSmoothedTargetPoints_RhinoCoords.Count == currentTargetPoints_RhinoCoords.Count) ?
+                                                             currentSmoothedTargetPoints_RhinoCoords :
+                                                             currentTargetPoints_RhinoCoords;
+
+            foreach (var target_Rhino_Vec3D in pointsToConsider)
+            {
+                Point3d target_Rhino_Pt = new Point3d(target_Rhino_Vec3D.X, target_Rhino_Vec3D.Y, target_Rhino_Vec3D.Z);
+                Point3d device_Rhino_Pt = new Point3d(devicePos_RhinoCoords.X, devicePos_RhinoCoords.Y, devicePos_RhinoCoords.Z);
+
+                Vector3d vecToTarget_Rhino = target_Rhino_Pt - device_Rhino_Pt;
+                double distance = vecToTarget_Rhino.Length;
+                double currentForceMag = 0;
+
+                if (distance < 0.001)
+                {
+                    // At the point, no force.
+                }
+                else if (falloffDistanceMultiPoint > 0.001) // Snapping with falloff enabled
+                {
+                    double totalAttractionRange = maxDistanceValueMultiPoint + falloffDistanceMultiPoint;
+                    if (distance >= totalAttractionRange)
+                    {
+                        currentForceMag = 0;
+                    }
+                    else if (distance > maxDistanceValueMultiPoint) // In falloff zone
+                    {
+                        double falloffProgress = (distance - maxDistanceValueMultiPoint) / falloffDistanceMultiPoint;
+                        currentForceMag = maxForceValueMultiPoint * (1.0 - falloffProgress);
+                    }
+                    else // In proportional zone
+                    {
+                        currentForceMag = maxForceValueMultiPoint * (distance / maxDistanceValueMultiPoint);
+                    }
+                }
+                else // Original behavior (no falloff, or falloff <= 0.001)
+                {
+                    if (distance > maxDistanceValueMultiPoint)
+                    {
+                        currentForceMag = maxForceValueMultiPoint;
+                    }
+                    else // distance <= maxDistanceValueMultiPoint
+                    {
+                        currentForceMag = maxForceValueMultiPoint * (distance / maxDistanceValueMultiPoint);
+                    }
+                }
+
+                currentForceMag = Math.Max(0, Math.Min(currentForceMag, maxForceValueMultiPoint));
+
+                if (currentForceMag > strongestForceMag)
+                {
+                    strongestForceMag = currentForceMag;
+                    if (distance > 0.001) vecToTarget_Rhino.Unitize();
+                    dominantForceVec_Rhino = vecToTarget_Rhino * strongestForceMag;
+                }
+            }
+
+            if (strongestForceMag <= 0.0) return new double[] { 0, 0, 0 };
+
+            return new double[] { -dominantForceVec_Rhino.X, dominantForceVec_Rhino.Z, dominantForceVec_Rhino.Y };
+        }
+
+
+        public static void SetPullToPlane(DeviceManager.Vector3D origin_RhinoCoords, DeviceManager.Vector3D normal_RhinoCoords, bool enable, double maxForce, double maxDistance)
         {
             pullToPlaneEnabled = enable;
-            planeOrigin = origin;
-            planeNormal = normal;
+            planeOrigin = origin_RhinoCoords;
+            double mag = Math.Sqrt(normal_RhinoCoords.X * normal_RhinoCoords.X + normal_RhinoCoords.Y * normal_RhinoCoords.Y + normal_RhinoCoords.Z * normal_RhinoCoords.Z);
+            if (mag > 0.0001)
+            {
+                planeNormal = new DeviceManager.Vector3D(normal_RhinoCoords.X / mag, normal_RhinoCoords.Y / mag, normal_RhinoCoords.Z / mag);
+            }
+            else
+            {
+                planeNormal = new DeviceManager.Vector3D(0, 1, 0);
+            }
             maxForceValuePlane = maxForce;
             maxDistanceValuePlane = maxDistance;
         }
 
-        /// <summary>
-        /// Calculates the force vector to pull the device towards the defined plane.
-        /// </summary>
-        private static double[] CalculatePullToPlaneForce(DeviceManager.Vector3D devicePos)
+        private static double[] CalculatePullToPlaneForce(DeviceManager.Vector3D devicePos_RhinoCoords)
         {
-            double dx = devicePos.X - planeOrigin.X;
-            double dy = devicePos.Y - planeOrigin.Y;
-            double dz = devicePos.Z - planeOrigin.Z;
-            double distance = dx * planeNormal.X + dy * planeNormal.Y + dz * planeNormal.Z;
+            double dx_rhino = devicePos_RhinoCoords.X - planeOrigin.X;
+            double dy_rhino = devicePos_RhinoCoords.Y - planeOrigin.Y;
+            double dz_rhino = devicePos_RhinoCoords.Z - planeOrigin.Z;
+
+            double distance = dx_rhino * planeNormal.X + dy_rhino * planeNormal.Y + dz_rhino * planeNormal.Z;
             double absDistance = Math.Abs(distance);
             double forceMagnitude;
 
@@ -378,33 +524,34 @@ namespace ghoh
             else forceMagnitude = (absDistance / maxDistanceValuePlane) * maxForceValuePlane;
 
             double directionSign = distance > 0 ? -1 : 1;
-            double fx = planeNormal.X * directionSign * forceMagnitude;
-            double fy = planeNormal.Y * directionSign * forceMagnitude;
-            double fz = planeNormal.Z * directionSign * forceMagnitude;
-            return new double[] { -fx, fz, fy }; // Rhino-like direction to Device Force components.
+
+            double fx_rhino = planeNormal.X * directionSign * forceMagnitude;
+            double fy_rhino = planeNormal.Y * directionSign * forceMagnitude;
+            double fz_rhino = planeNormal.Z * directionSign * forceMagnitude;
+
+            return new double[] { -fx_rhino, fz_rhino, fy_rhino };
         }
 
-        /// <summary>
-        /// Sets parameters for plane collision.
-        /// </summary>
-        public static void SetPlaneCollision(DeviceManager.Vector3D origin, DeviceManager.Vector3D normal, bool enable, double maxForce, double maxDistance)
+        public static void SetPlaneCollision(DeviceManager.Vector3D origin_RhinoCoords, DeviceManager.Vector3D normal_RhinoCoords, bool enable, double maxForce, double maxDistance)
         {
             planeCollisionEnabled = enable;
-            collisionPlaneOrigin = origin;
-            collisionPlaneNormal = normal;
+            collisionPlaneOrigin = origin_RhinoCoords;
+            double mag = Math.Sqrt(normal_RhinoCoords.X * normal_RhinoCoords.X + normal_RhinoCoords.Y * normal_RhinoCoords.Y + normal_RhinoCoords.Z * normal_RhinoCoords.Z);
+            if (mag > 0.0001)
+            {
+                collisionPlaneNormal = new DeviceManager.Vector3D(normal_RhinoCoords.X / mag, normal_RhinoCoords.Y / mag, normal_RhinoCoords.Z / mag);
+            }
+            else { collisionPlaneNormal = new DeviceManager.Vector3D(0, 1, 0); }
             maxForceValueCollision = maxForce;
             maxDistanceValueCollision = maxDistance;
         }
 
-        /// <summary>
-        /// Calculates the collision force if the device penetrates the collision plane.
-        /// </summary>
-        private static double[] CalculatePlaneCollisionForce(DeviceManager.Vector3D devicePos)
+        private static double[] CalculatePlaneCollisionForce(DeviceManager.Vector3D devicePos_RhinoCoords)
         {
-            double dx = devicePos.X - collisionPlaneOrigin.X;
-            double dy = devicePos.Y - collisionPlaneOrigin.Y;
-            double dz = devicePos.Z - collisionPlaneOrigin.Z;
-            double distance = dx * collisionPlaneNormal.X + dy * collisionPlaneNormal.Y + dz * collisionPlaneNormal.Z;
+            double dx_rhino = devicePos_RhinoCoords.X - collisionPlaneOrigin.X;
+            double dy_rhino = devicePos_RhinoCoords.Y - collisionPlaneOrigin.Y;
+            double dz_rhino = devicePos_RhinoCoords.Z - collisionPlaneOrigin.Z;
+            double distance = dx_rhino * collisionPlaneNormal.X + dy_rhino * collisionPlaneNormal.Y + dz_rhino * collisionPlaneNormal.Z;
 
             if (distance >= 0) return new double[] { 0, 0, 0 };
 
@@ -414,41 +561,38 @@ namespace ghoh
             if (penetrationDepth > maxDistanceValueCollision) forceMagnitude = maxForceValueCollision;
             else forceMagnitude = (penetrationDepth / maxDistanceValueCollision) * maxForceValueCollision;
 
-            double fx = collisionPlaneNormal.X * forceMagnitude;
-            double fy = collisionPlaneNormal.Y * forceMagnitude;
-            double fz = collisionPlaneNormal.Z * forceMagnitude;
-            return new double[] { -fx, fz, fy }; // Rhino-like direction to Device Force components.
+            double fx_rhino = collisionPlaneNormal.X * forceMagnitude;
+            double fy_rhino = collisionPlaneNormal.Y * forceMagnitude;
+            double fz_rhino = collisionPlaneNormal.Z * forceMagnitude;
+            return new double[] { -fx_rhino, fz_rhino, fy_rhino };
         }
 
-        /// <summary>
-        /// Applies damping to a given force vector.
-        /// </summary>
-        private static double[] ApplyDamping(double[] currentForce, double timeDelta)
+        private static double[] ApplyDamping(double[] currentForce_deviceCoords, double timeDelta)
         {
             if (!dampingEnabled || (dampingCoefficient < 0.01 && derivativeDampingCoefficient < 0.01))
             {
                 previousForce = (double[])lastAppliedForce.Clone();
-                lastAppliedForce = (double[])currentForce.Clone();
-                return currentForce;
+                lastAppliedForce = (double[])currentForce_deviceCoords.Clone();
+                return currentForce_deviceCoords;
             }
             double[] dampedForce = new double[3];
             switch (currentDampingMethod)
             {
                 case DampingMethod.ExponentialSmoothing:
                     double alpha = 1.0 - dampingCoefficient;
-                    for (int i = 0; i < 3; i++) dampedForce[i] = alpha * currentForce[i] + dampingCoefficient * lastAppliedForce[i];
+                    for (int i = 0; i < 3; i++) dampedForce[i] = alpha * currentForce_deviceCoords[i] + dampingCoefficient * lastAppliedForce[i];
                     break;
                 case DampingMethod.ForceDerivative:
                     for (int i = 0; i < 3; i++)
                     {
-                        double derivative = (currentForce[i] - previousForce[i]) / Math.Max(0.001, timeDelta);
-                        dampedForce[i] = currentForce[i] - (derivativeDampingCoefficient * derivative);
+                        double derivative = (currentForce_deviceCoords[i] - previousForce[i]) / Math.Max(0.001, timeDelta);
+                        dampedForce[i] = currentForce_deviceCoords[i] - (derivativeDampingCoefficient * derivative);
                     }
                     break;
                 case DampingMethod.Both:
                     double alphaBoth = 1.0 - dampingCoefficient;
                     double[] smoothedForce = new double[3];
-                    for (int i = 0; i < 3; i++) smoothedForce[i] = alphaBoth * currentForce[i] + dampingCoefficient * lastAppliedForce[i];
+                    for (int i = 0; i < 3; i++) smoothedForce[i] = alphaBoth * currentForce_deviceCoords[i] + dampingCoefficient * lastAppliedForce[i];
                     for (int i = 0; i < 3; i++)
                     {
                         double derivative = (smoothedForce[i] - previousForce[i]) / Math.Max(0.001, timeDelta);
@@ -456,7 +600,7 @@ namespace ghoh
                     }
                     break;
                 default:
-                    Array.Copy(currentForce, dampedForce, 3);
+                    Array.Copy(currentForce_deviceCoords, dampedForce, 3);
                     break;
             }
             previousForce = (double[])lastAppliedForce.Clone();
@@ -464,29 +608,19 @@ namespace ghoh
             return dampedForce;
         }
 
-        // --- Multi-Point Vibration Methods ---
-
-        /// <summary>
-        /// Clears all currently defined vibration points and disables point vibrations.
-        /// </summary>
         public static void ClearVibratePoints()
         {
             activeVibrationPoints.Clear();
             globalVibrationPointEnabled = false;
         }
 
-        /// <summary>
-        /// Sets or updates the list of points for vibration.
-        /// All points share common behavioral parameters (direction, frequency, etc.).
-        /// The overallMaxAmplitude parameter from GH component will be used to cap the final combined vibration.
-        /// </summary>
         public static void SetVibratePoints(
             List<DeviceManager.Vector3D> deviceSpaceTargets,
             DeviceManager.Vector3D deviceSpaceDirection,
             bool enable,
             double deadzone,
             double maxDistance,
-            double overallMaxAmplitude, // This is the MaxAmplitude from GH, used for capping.
+            double overallMaxAmplitude,
             double frequency,
             bool invertMapping,
             bool useSquareWave)
@@ -512,12 +646,11 @@ namespace ghoh
             }
             else if (dirMagSq < 0.000001)
             {
-                normalizedDeviceDirection = new DeviceManager.Vector3D(0, 0, 1); // Default to Z-axis.
+                normalizedDeviceDirection = new DeviceManager.Vector3D(0, 0, 1);
             }
 
             double clampedDeadzone = Math.Max(0.0, deadzone);
             double clampedMaxDistance = Math.Max(clampedDeadzone + 0.001, maxDistance);
-            // Store the overallMaxAmplitude for capping the final combined effect.
             currentOverallMaxVibrationAmplitude = Math.Max(0.0, Math.Min(3.0, overallMaxAmplitude));
             double clampedFrequency = Math.Max(1.0, Math.Min(1000.0, frequency));
 
@@ -529,8 +662,6 @@ namespace ghoh
                     Direction = normalizedDeviceDirection,
                     Deadzone = clampedDeadzone,
                     MaxDistance = clampedMaxDistance,
-                    // Each point's individual max contribution is the overall cap.
-                    // This means if only one point is active, it can reach currentOverallMaxVibrationAmplitude.
                     MaxAmplitude = currentOverallMaxVibrationAmplitude,
                     Frequency = clampedFrequency,
                     InvertMapping = invertMapping,
@@ -539,42 +670,36 @@ namespace ghoh
             }
         }
 
-        /// <summary>
-        /// Calculates the combined vibration force from all active points,
-        /// capping the effective total amplitude.
-        /// </summary>
-        private static double[] CalculateCombinedVibrationForce(DeviceManager.Vector3D currentDevicePos)
+        private static double[] CalculateCombinedVibrationForce(DeviceManager.Vector3D currentDevicePos_native)
         {
-            // This vector will store the sum of (Direction_force_coords * individual_amplitude_factor_for_this_point).
-            // Its magnitude represents the potential combined amplitude before global capping and oscillation.
-            double[] summedPotentialForceDirection = new double[] { 0, 0, 0 };
+            double[] summedPotentialForceDirection_native = new double[] { 0, 0, 0 };
 
             if (!globalVibrationPointEnabled || activeVibrationPoints.Count == 0)
             {
-                return summedPotentialForceDirection; // Returns {0,0,0}
+                return summedPotentialForceDirection_native;
             }
 
             foreach (var pointData in activeVibrationPoints)
             {
-                double dx = currentDevicePos.X - pointData.Target.X;
-                double dy = currentDevicePos.Y - pointData.Target.Y;
-                double dz = currentDevicePos.Z - pointData.Target.Z;
+                double dx = currentDevicePos_native.X - pointData.Target.X;
+                double dy = currentDevicePos_native.Y - pointData.Target.Y;
+                double dz = currentDevicePos_native.Z - pointData.Target.Z;
                 double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
-                // This 'individualAmplitudeFactor' is how much this point *would* contribute (0 to pointData.MaxAmplitude).
-                // pointData.MaxAmplitude here is already set to currentOverallMaxVibrationAmplitude.
                 double individualAmplitudeFactor = 0.0;
                 double usableRange = pointData.MaxDistance - pointData.Deadzone;
+                if (usableRange < 0.001) usableRange = 0.001;
+
 
                 if (pointData.InvertMapping)
                 {
                     if (distance >= pointData.MaxDistance) individualAmplitudeFactor = 0.0;
-                    else if (distance < pointData.Deadzone) individualAmplitudeFactor = pointData.MaxAmplitude; // Can reach full potential
+                    else if (distance < pointData.Deadzone) individualAmplitudeFactor = pointData.MaxAmplitude;
                     else individualAmplitudeFactor = (1.0 - (distance - pointData.Deadzone) / usableRange) * pointData.MaxAmplitude;
                 }
                 else
                 {
-                    if (distance >= pointData.MaxDistance) individualAmplitudeFactor = pointData.MaxAmplitude; // Can reach full potential
+                    if (distance >= pointData.MaxDistance) individualAmplitudeFactor = pointData.MaxAmplitude;
                     else if (distance < pointData.Deadzone) individualAmplitudeFactor = 0.0;
                     else individualAmplitudeFactor = ((distance - pointData.Deadzone) / usableRange) * pointData.MaxAmplitude;
                 }
@@ -582,31 +707,24 @@ namespace ghoh
 
                 if (individualAmplitudeFactor < 0.0001) continue;
 
-                // Accumulate the potential force contribution (direction * factor) for this point.
-                // Oscillation is applied once at the end to the capped sum.
-                // The Direction components are from device orientation space, convert to device force space.
-                summedPotentialForceDirection[0] += -pointData.Direction.X * individualAmplitudeFactor;
-                summedPotentialForceDirection[1] += pointData.Direction.Z * individualAmplitudeFactor;
-                summedPotentialForceDirection[2] += pointData.Direction.Y * individualAmplitudeFactor;
+                summedPotentialForceDirection_native[0] += pointData.Direction.X * individualAmplitudeFactor;
+                summedPotentialForceDirection_native[1] += pointData.Direction.Y * individualAmplitudeFactor;
+                summedPotentialForceDirection_native[2] += pointData.Direction.Z * individualAmplitudeFactor;
             }
 
-            // Calculate the magnitude of the summed potential force vector.
             double currentTotalPotentialMagnitude = Math.Sqrt(
-                summedPotentialForceDirection[0] * summedPotentialForceDirection[0] +
-                summedPotentialForceDirection[1] * summedPotentialForceDirection[1] +
-                summedPotentialForceDirection[2] * summedPotentialForceDirection[2]
+                summedPotentialForceDirection_native[0] * summedPotentialForceDirection_native[0] +
+                summedPotentialForceDirection_native[1] * summedPotentialForceDirection_native[1] +
+                summedPotentialForceDirection_native[2] * summedPotentialForceDirection_native[2]
             );
 
-            // Determine scaling factor to cap the magnitude to currentOverallMaxVibrationAmplitude.
             double capScaleFactor = 1.0;
             if (currentTotalPotentialMagnitude > currentOverallMaxVibrationAmplitude && currentTotalPotentialMagnitude > 0.0001)
             {
                 capScaleFactor = currentOverallMaxVibrationAmplitude / currentTotalPotentialMagnitude;
             }
 
-            // Get the global oscillation multiplier (using parameters from the first active point as representative,
-            // as frequency and wave type are shared among all points in a single SetVibratePoints call).
-            double representativeFrequency = 100.0; // Default if no points (though list shouldn't be empty here).
+            double representativeFrequency = 100.0;
             bool representativeSquareWave = false;
             if (activeVibrationPoints.Count > 0)
             {
@@ -615,105 +733,368 @@ namespace ghoh
             }
             double oscillation = Vibration.GetVibrationMultiplier(representativeFrequency, representativeSquareWave);
 
-            // Apply capping scale factor and oscillation to the summed potential force.
-            double[] finalCombinedForce = new double[3];
-            finalCombinedForce[0] = summedPotentialForceDirection[0] * capScaleFactor * oscillation;
-            finalCombinedForce[1] = summedPotentialForceDirection[1] * capScaleFactor * oscillation;
-            finalCombinedForce[2] = summedPotentialForceDirection[2] * capScaleFactor * oscillation;
+            double[] finalCombinedForce_native = new double[3];
+            finalCombinedForce_native[0] = summedPotentialForceDirection_native[0] * capScaleFactor * oscillation;
+            finalCombinedForce_native[1] = summedPotentialForceDirection_native[1] * capScaleFactor * oscillation;
+            finalCombinedForce_native[2] = summedPotentialForceDirection_native[2] * capScaleFactor * oscillation;
 
-            return finalCombinedForce;
+            return finalCombinedForce_native;
         }
 
-
-        // --- Curve-based forces and vibrations (Placeholders for brevity, ensure your full implementations are here) ---
-        public static void SetPullToCurve(Curve curve, bool enable, double maxForce, double maxDistance, bool fade, int method, double tangentForceValue, bool pullAlong, double speed, bool reset)
+        public static void SetPullToCurve(Curve curve_RhinoCoords, bool enable, double maxForce, double maxDistance,
+                                        double falloffDist, bool fade, int method, double tangentForceValue,
+                                        bool pullAlong, double speed, bool resetInput)
         {
-            pullToCurveEnabled = enable; pullToCurve = curve; maxForceValueCurve = maxForce; /* ... more params ... */
-        }
-        private static double[] CalculatePullToCurveForce(DeviceManager.Vector3D devicePos) { /* ... Your complex logic ... */ return new double[3]; }
+            bool previousEnableState = pullToCurveEnabled;
+            Curve previousCurve = pullToCurve;
 
-        public static void SetVibrateCurve(Curve curve, DeviceManager.Vector3D direction, bool enable, double deadzone, double maxDistance, double maxAmplitude, double frequency, bool invertMapping, bool useSquareWave)
+            pullToCurveEnabled = enable;
+
+            if (enable)
+            {
+                if (curve_RhinoCoords == null)
+                {
+                    pullToCurveEnabled = false;
+                    pullToCurve = null;
+                    totalCurveLength = 0;
+                }
+                else if (pullToCurve != curve_RhinoCoords || (pullToCurve != null && curve_RhinoCoords != null && pullToCurve.ToNurbsCurve().Points.Count != curve_RhinoCoords.ToNurbsCurve().Points.Count)) // Basic check for curve change, more robust needed for content
+                {
+                    pullToCurve = curve_RhinoCoords; // Should be a copy from GH component
+                    totalCurveLength = pullToCurve.GetLength();
+                    ResetTravelingPoint();
+                }
+                else if (!previousEnableState)
+                {
+                    lastTravelingPointUpdateTime = DateTime.Now;
+                }
+            }
+
+            maxForceValueCurve = maxForce;
+            maxDistanceValueCurve = Math.Max(0.001, maxDistance);
+            pullCurveFalloffDistance = Math.Max(0.0, falloffDist);
+            pullCurveFade = fade;
+            pullCurveMethod = method;
+            tangentForce = tangentForceValue;
+            pullAlongEnabled = pullAlong;
+            travelingPointSpeed = speed;
+
+            if (resetInput)
+            {
+                ResetTravelingPoint();
+            }
+        }
+
+        private static double[] CalculatePullToCurveForce(DeviceManager.Vector3D devicePos_RhinoCoords)
         {
-            vibrationCurveEnabled = enable; vibrationCurve = curve; vibrationCurveDirection = direction; /* ... more params ... */
+            if (!pullToCurveEnabled || pullToCurve == null)
+            {
+                travelingPointActive = false;
+                return new double[] { 0, 0, 0 };
+            }
+
+            Point3d rhinoDevicePt = new Point3d(devicePos_RhinoCoords.X, devicePos_RhinoCoords.Y, devicePos_RhinoCoords.Z);
+            double curveParam;
+            if (!pullToCurve.ClosestPoint(rhinoDevicePt, out curveParam))
+            {
+                return new double[] { 0, 0, 0 };
+            }
+
+            Point3d closestPointOnCurve_Rhino = pullToCurve.PointAt(curveParam);
+            Vector3d vectorToCurve_Rhino = closestPointOnCurve_Rhino - rhinoDevicePt;
+            double distanceToCurve = vectorToCurve_Rhino.Length;
+
+            double currentEffectiveMaxForce = maxForceValueCurve;
+
+            if (pullCurveFade && totalCurveLength > 0.001)
+            {
+                double lengthAtParam = pullToCurve.GetLength(new Interval(pullToCurve.Domain.Min, curveParam));
+                double progress = Math.Max(0.0, Math.Min(1.0, lengthAtParam / totalCurveLength));
+                currentEffectiveMaxForce *= progress;
+            }
+
+            double pullMagnitude = 0;
+            if (distanceToCurve < 0.001)
+            {
+                pullMagnitude = 0;
+            }
+            else if (pullCurveFalloffDistance > 0.001)
+            {
+                double totalAttractionRange = maxDistanceValueCurve + pullCurveFalloffDistance;
+                if (distanceToCurve >= totalAttractionRange)
+                {
+                    pullMagnitude = 0;
+                }
+                else if (distanceToCurve > maxDistanceValueCurve)
+                {
+                    double falloffProgress = (distanceToCurve - maxDistanceValueCurve) / pullCurveFalloffDistance;
+                    pullMagnitude = currentEffectiveMaxForce * (1.0 - falloffProgress);
+                }
+                else
+                {
+                    pullMagnitude = currentEffectiveMaxForce * (distanceToCurve / maxDistanceValueCurve);
+                }
+            }
+            else
+            {
+                if (distanceToCurve > maxDistanceValueCurve)
+                {
+                    pullMagnitude = currentEffectiveMaxForce;
+                }
+                else
+                {
+                    pullMagnitude = currentEffectiveMaxForce * (distanceToCurve / maxDistanceValueCurve);
+                }
+            }
+
+            pullMagnitude = Math.Max(0, Math.Min(pullMagnitude, currentEffectiveMaxForce));
+
+            Vector3d totalForceVector_Rhino = Vector3d.Zero;
+            if (pullMagnitude > 0.001 && distanceToCurve > 0.001)
+            {
+                vectorToCurve_Rhino.Unitize();
+                totalForceVector_Rhino = vectorToCurve_Rhino * pullMagnitude;
+            }
+
+            if (pullAlongEnabled && pullMagnitude > 0.001)
+            {
+                travelingPointActive = true;
+                UpdateTravelingPointPosition();
+
+                Vector3d alongCurveDirection_Rhino = Vector3d.Zero;
+                double alongCurveForceMagnitude = 0;
+
+                if (pullCurveMethod == 0)
+                {
+                    alongCurveDirection_Rhino = pullToCurve.TangentAt(curveParam);
+                    alongCurveForceMagnitude = tangentForce * currentEffectiveMaxForce;
+                }
+                else if (pullCurveMethod == 1)
+                {
+                    if (totalCurveLength > 0.001)
+                    {
+                        double travelingParam = FindParameterAtLength(pullToCurve, travelingPointLengthPosition);
+                        Point3d targetPtOnCurve_Rhino = pullToCurve.PointAt(travelingParam);
+                        alongCurveDirection_Rhino = targetPtOnCurve_Rhino - closestPointOnCurve_Rhino;
+                        alongCurveForceMagnitude = tangentForce;
+                    }
+                }
+
+                if (alongCurveDirection_Rhino.SquareLength > 0.00001 && alongCurveForceMagnitude > 0.001)
+                {
+                    alongCurveDirection_Rhino.Unitize();
+                    totalForceVector_Rhino += alongCurveDirection_Rhino * alongCurveForceMagnitude;
+                }
+            }
+            else
+            {
+                travelingPointActive = false;
+            }
+
+            return new double[] { -totalForceVector_Rhino.X, totalForceVector_Rhino.Z, totalForceVector_Rhino.Y };
         }
-        private static double[] CalculateVibrationCurveForce(DeviceManager.Vector3D devicePos) { /* ... Your complex logic ... */ return new double[3]; }
-        private static void ResetTravelingPoint() { /* ... */ }
-        private static double FindParameterAtLength(Curve curve, double targetLength) { /* ... */ return 0.0; }
-        private static void UpdateTravelingPointPosition() { /* ... */ }
 
+        private static void ResetTravelingPoint()
+        {
+            travelingPointLengthPosition = 0.0;
+            lastTravelingPointUpdateTime = DateTime.Now;
+            travelingPointActive = false;
+        }
 
-        // --- Main Force Calculation Loop (Called by DeviceManager's servo loop) ---
+        private static void UpdateTravelingPointPosition()
+        {
+            if (!pullToCurveEnabled || !pullAlongEnabled || pullCurveMethod != 1 || !travelingPointActive || pullToCurve == null || totalCurveLength < 0.001)
+            {
+                return;
+            }
+
+            DateTime currentTime = DateTime.Now;
+            double timeDelta = (currentTime - lastTravelingPointUpdateTime).TotalSeconds;
+            lastTravelingPointUpdateTime = currentTime;
+
+            if (timeDelta <= 0) return;
+
+            double distanceToTravel = travelingPointSpeed * timeDelta;
+            travelingPointLengthPosition += distanceToTravel;
+
+            if (pullToCurve.IsClosed)
+            {
+                travelingPointLengthPosition = (travelingPointLengthPosition % totalCurveLength + totalCurveLength) % totalCurveLength;
+            }
+            else
+            {
+                travelingPointLengthPosition = Math.Max(0, Math.Min(travelingPointLengthPosition, totalCurveLength));
+            }
+        }
+
+        private static double FindParameterAtLength(Curve curve, double targetLength)
+        {
+            if (curve == null) return 0.0;
+            double curveTotalLength = curve.GetLength();
+            if (curveTotalLength < 0.001) return curve.Domain.Min;
+
+            double clampedLength = targetLength;
+            if (curve.IsClosed)
+            {
+                clampedLength = (targetLength % curveTotalLength + curveTotalLength) % curveTotalLength;
+            }
+            else
+            {
+                clampedLength = Math.Max(0, Math.Min(targetLength, curveTotalLength));
+            }
+
+            double t;
+            // Use Curve.LengthParameter which finds parameter at a given length from start of curve.
+            if (curve.LengthParameter(clampedLength, out t))
+            {
+                return t;
+            }
+
+            // Fallback for safety / if LengthParameter fails (shouldn't for valid inputs)
+            if (clampedLength <= 0.0) return curve.Domain.Min;
+            if (clampedLength >= curveTotalLength && !curve.IsClosed) return curve.Domain.Max;
+
+            return curve.Domain.Min;
+        }
+
+        public static void SetVibrateCurve(Curve curve_RhinoCoords, DeviceManager.Vector3D direction_RhinoCoords, bool enable, double deadzone, double maxDistance, double maxAmplitude, double frequency, bool invertMapping, bool useSquareWave)
+        {
+            vibrationCurveEnabled = enable;
+            vibrationCurve = curve_RhinoCoords;
+            vibrationCurveDirection = direction_RhinoCoords;
+            vibrationCurveDeadzone = deadzone;
+            vibrationCurveMaxDistance = maxDistance;
+            vibrationCurveMaxAmplitude = maxAmplitude;
+            vibrationCurveFrequency = frequency;
+            vibrationCurveInvertMapping = invertMapping;
+            vibrationCurveUseSquareWave = useSquareWave;
+        }
+
+        private static double[] CalculateVibrationCurveForce(DeviceManager.Vector3D devicePos_RhinoCoords)
+        {
+            if (!vibrationCurveEnabled || vibrationCurve == null)
+            {
+                vibrationCurveAmplitude = 0; vibrationCurveDistance = -1; return new double[3];
+            }
+            curveCalcStopwatch.Restart();
+
+            Point3d rhinoDevicePt = new Point3d(devicePos_RhinoCoords.X, devicePos_RhinoCoords.Y, devicePos_RhinoCoords.Z);
+            double curveParam;
+            vibrationCurve.ClosestPoint(rhinoDevicePt, out curveParam);
+            Point3d closestPt = vibrationCurve.PointAt(curveParam);
+
+            vibrationCurveDistance = rhinoDevicePt.DistanceTo(closestPt);
+
+            double amplitudeFactor = 0.0;
+            double usableRange = vibrationCurveMaxDistance - vibrationCurveDeadzone;
+            if (usableRange < 0.001) usableRange = 0.001;
+
+            if (vibrationCurveInvertMapping)
+            {
+                if (vibrationCurveDistance >= vibrationCurveMaxDistance) amplitudeFactor = 0.0;
+                else if (vibrationCurveDistance < vibrationCurveDeadzone) amplitudeFactor = 1.0;
+                else amplitudeFactor = 1.0 - ((vibrationCurveDistance - vibrationCurveDeadzone) / usableRange);
+            }
+            else
+            {
+                if (vibrationCurveDistance >= vibrationCurveMaxDistance) amplitudeFactor = 1.0;
+                else if (vibrationCurveDistance < vibrationCurveDeadzone) amplitudeFactor = 0.0;
+                else amplitudeFactor = (vibrationCurveDistance - vibrationCurveDeadzone) / usableRange;
+            }
+            amplitudeFactor = Math.Max(0.0, Math.Min(1.0, amplitudeFactor));
+            vibrationCurveAmplitude = vibrationCurveMaxAmplitude * amplitudeFactor;
+
+            double oscillation = Vibration.GetVibrationMultiplier(vibrationCurveFrequency, vibrationCurveUseSquareWave);
+            double currentVibMag = vibrationCurveAmplitude * oscillation;
+
+            Vector3d vibDir_Rhino = new Vector3d(vibrationCurveDirection.X, vibrationCurveDirection.Y, vibrationCurveDirection.Z);
+            if (!vibDir_Rhino.Unitize()) vibDir_Rhino = new Vector3d(0, 0, 1);
+
+            Vector3d force_Rhino = vibDir_Rhino * currentVibMag;
+
+            curveCalcStopwatch.Stop();
+            vibrationCurveCalcTime = curveCalcStopwatch.Elapsed.TotalMilliseconds;
+
+            return new double[] { -force_Rhino.X, force_Rhino.Z, force_Rhino.Y };
+        }
+
         public static void UpdateForces()
         {
-            DateTime currentTime = DateTime.Now; // For time-dependent calculations like damping.
-            double[] totalForceForFrame = new double[3]; // Initialize total force for this frame to zero.
+            DateTime currentTime = DateTime.Now;
+            double[] totalForceForFrame_DeviceCoords = new double[3];
 
-            var transformMatrix = new double[16]; // To store device's current transform.
+            var transformMatrix = new double[16];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, transformMatrix);
 
-            // Determine current device position in device coordinates.
-            var currentDevicePos = new DeviceManager.Vector3D(
+            var currentDevicePos_RhinoCoords = new DeviceManager.Vector3D(
                 -transformMatrix[12],
                  transformMatrix[14],
                  transformMatrix[13]
             );
 
-            // Apply TCP offset if configured.
+            var currentDevicePos_NativeDeviceCoords = new DeviceManager.Vector3D(
+                transformMatrix[12],
+                transformMatrix[13],
+                transformMatrix[14]
+            );
+
             if (tcpOffset.X != 0 || tcpOffset.Y != 0 || tcpOffset.Z != 0)
             {
-                var xDir = new DeviceManager.Vector3D(-transformMatrix[0], transformMatrix[2], transformMatrix[1]);
-                var yDir = new DeviceManager.Vector3D(-transformMatrix[4], transformMatrix[6], transformMatrix[5]);
-                var zDir = new DeviceManager.Vector3D(-transformMatrix[8], transformMatrix[10], transformMatrix[9]);
-                currentDevicePos.X += tcpOffset.X * xDir.X + tcpOffset.Y * yDir.X + tcpOffset.Z * zDir.X;
-                currentDevicePos.Y += tcpOffset.X * xDir.Y + tcpOffset.Y * yDir.Y + tcpOffset.Z * zDir.Y;
-                currentDevicePos.Z += tcpOffset.X * zDir.X + tcpOffset.Y * zDir.Y + tcpOffset.Z * zDir.Z;
+                var devXaxis_inRhino = new DeviceManager.Vector3D(-transformMatrix[0], transformMatrix[2], transformMatrix[1]);
+                var devYaxis_inRhino = new DeviceManager.Vector3D(-transformMatrix[4], transformMatrix[6], transformMatrix[5]);
+                var devZaxis_inRhino = new DeviceManager.Vector3D(-transformMatrix[8], transformMatrix[10], transformMatrix[9]);
+
+                currentDevicePos_RhinoCoords.X += tcpOffset.X * devXaxis_inRhino.X + tcpOffset.Y * devYaxis_inRhino.X + tcpOffset.Z * devZaxis_inRhino.X;
+                currentDevicePos_RhinoCoords.Y += tcpOffset.X * devXaxis_inRhino.Y + tcpOffset.Y * devYaxis_inRhino.Y + tcpOffset.Z * devZaxis_inRhino.Y;
+                currentDevicePos_RhinoCoords.Z += tcpOffset.X * devXaxis_inRhino.Z + tcpOffset.Y * devYaxis_inRhino.Z + tcpOffset.Z * devZaxis_inRhino.Z;
             }
 
-            // --- Accumulate all active forces ---
             if (viscousDampingEnabled)
             {
-                var f = CalculateViscousForce(); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculateViscousForce(); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
             if (planeCollisionEnabled)
             {
-                var f = CalculatePlaneCollisionForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculatePlaneCollisionForce(currentDevicePos_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
-            // Combined Point Vibration
             if (globalVibrationPointEnabled && activeVibrationPoints.Count > 0)
             {
-                var f = CalculateCombinedVibrationForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculateCombinedVibrationForce(currentDevicePos_NativeDeviceCoords); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
             if (vibrationCurveEnabled && vibrationCurve != null)
             {
-                var f = CalculateVibrationCurveForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculateVibrationCurveForce(currentDevicePos_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
-            if (pullToPointEnabled)
+
+            // --- Updated PullToPoint Logic ---
+            if (multiPullToPointEnabled)
             {
-                UpdateSmoothedTarget(currentDevicePos);
-                var f = CalculatePullToPointForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                if (smoothingEnabledMultiPoint) UpdateSmoothedTargets(); // Update smoothed positions if enabled
+                var f = CalculateMultiPullToPointForce(currentDevicePos_RhinoCoords);
+                for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
+            // --- End Updated PullToPoint Logic ---
+
             if (pullToCurveEnabled && pullToCurve != null)
             {
-                var f = CalculatePullToCurveForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculatePullToCurveForce(currentDevicePos_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
             if (pullToPlaneEnabled)
             {
-                var f = CalculatePullToPlaneForce(currentDevicePos); for (int i = 0; i < 3; i++) totalForceForFrame[i] += f[i];
+                var f = CalculatePullToPlaneForce(currentDevicePos_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += f[i];
             }
-            // Direct forces (filtered or raw)
             if (filteredForceEnabled && forceFilter != null)
             {
-                for (int i = 0; i < 3; i++) totalForceForFrame[i] += lastFilteredForce[i];
+                for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += lastFilteredForce[i];
             }
             else if (directForceEnabled)
             {
-                for (int i = 0; i < 3; i++) totalForceForFrame[i] += currentDirectForce[i];
+                for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += currentDirectForce[i];
             }
 
-            // Microcontroller force input (example using reflection for robustness)
             try
             {
-                var ucManagerType = Type.GetType("ghoh.UCManager"); // Attempt to get UCManager type.
+                var ucManagerType = Type.GetType("ghoh.UCManager");
                 if (ucManagerType != null)
                 {
                     var isConnectedProp = ucManagerType.GetProperty("IsConnected");
@@ -723,63 +1104,68 @@ namespace ghoh
                     if (isConnectedProp != null && forceEnabledProp != null && getMappedForceMethod != null &&
                         (bool)isConnectedProp.GetValue(null) && (bool)forceEnabledProp.GetValue(null))
                     {
-                        var zDirDevice = new DeviceManager.Vector3D(-transformMatrix[8], transformMatrix[10], transformMatrix[9]);
+                        var devZaxis_inRhino = new DeviceManager.Vector3D(-transformMatrix[8], transformMatrix[10], transformMatrix[9]);
                         double rawMCVal = (double)getMappedForceMethod.Invoke(null, null);
-                        if (rawMCVal > 0.001)
+
+                        if (Math.Abs(rawMCVal) > 0.001)
                         {
-                            double fx = zDirDevice.X * rawMCVal;
-                            double fy = zDirDevice.Y * rawMCVal;
-                            double fz = zDirDevice.Z * rawMCVal;
-                            double[] mcForce = new double[3] { -fx, fz, fy };
+                            double fx_rhino = devZaxis_inRhino.X * rawMCVal;
+                            double fy_rhino = devZaxis_inRhino.Y * rawMCVal;
+                            double fz_rhino = devZaxis_inRhino.Z * rawMCVal;
+
+                            double[] mcForce_deviceCoords = new double[3] { -fx_rhino, fz_rhino, fy_rhino };
+
                             double timeDelta = (currentTime - lastForceUpdateTime).TotalSeconds;
-                            lastForceUpdateTime = currentTime;
-                            double[] dampedMCForce = ApplyDamping(mcForce, timeDelta);
-                            for (int i = 0; i < 3; i++) totalForceForFrame[i] += dampedMCForce[i];
+                            double[] dampedMCForce = ApplyDamping(mcForce_deviceCoords, timeDelta);
+                            for (int i = 0; i < 3; i++) totalForceForFrame_DeviceCoords[i] += dampedMCForce[i];
                         }
                     }
                 }
             }
-            catch (Exception) { /* Silently ignore if UCManager reflection fails, or log error if preferred. */ }
-            // --- End Force Accumulation ---
+            catch (Exception) { /* Silently ignore */ }
+            lastForceUpdateTime = currentTime;
 
-            currentTotalForce = (double[])totalForceForFrame.Clone();
-            HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForceForFrame);
+            currentTotalForce = (double[])totalForceForFrame_DeviceCoords.Clone();
+            HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForceForFrame_DeviceCoords);
         }
 
-        /// <summary>
-        /// Resets all force states to their defaults and clears forces on the device.
-        /// </summary>
         public static void Reset()
         {
             directForceEnabled = false;
-            pullToPointEnabled = false;
+
+            // Reset new multi-point pull parameters
+            multiPullToPointEnabled = false;
+            currentTargetPoints_RhinoCoords.Clear();
+            currentSmoothedTargetPoints_RhinoCoords.Clear();
+            maxForceValueMultiPoint = 1.0;
+            maxDistanceValueMultiPoint = 1.0;
+            falloffDistanceMultiPoint = 0.0;
+            smoothingEnabledMultiPoint = false;
+            maxStepMultiPoint = 5.0;
+
             pullToPlaneEnabled = false;
             filteredForceEnabled = false;
-            interpolationEnabled = false;
             dampingEnabled = false;
             viscousDampingEnabled = false;
             planeCollisionEnabled = false;
+
             vibrationCurveEnabled = false;
-            pullToCurveEnabled = false;
-
-            tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
-            ClearVibratePoints();
-            currentOverallMaxVibrationAmplitude = 3.0; // Reset to a default max amplitude.
-
             vibrationCurve = null;
+
+            pullToCurveEnabled = false;
             pullToCurve = null;
-            originalPullToCurve = null;
+            pullCurveFalloffDistance = 0.0;
             pullCurveFade = false;
             pullCurveMethod = 0;
             pullAlongEnabled = false;
             travelingPointSpeed = 10.0;
-            travelingPointPosition = 0.0;
-            travelingPointLengthPosition = 0.0;
-            lastTravelingPointUpdateTime = DateTime.Now;
-            travelingPointActive = false;
+            ResetTravelingPoint();
             totalCurveLength = 0.0;
-            originalCurveLength = 0.0;
             tangentForce = 1.0;
+
+            tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
+            ClearVibratePoints();
+            currentOverallMaxVibrationAmplitude = 3.0;
 
             Vibration.Reset();
             if (forceFilter != null) forceFilter.Reset();
