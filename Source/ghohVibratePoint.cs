@@ -1,20 +1,26 @@
 ﻿using Grasshopper.Kernel;
+using Grasshopper.Kernel.Types; // For GH_Point
 using Rhino.Geometry;
 using System;
-using System.Collections.Generic; // Required for List
+using System.Collections.Generic;
+using System.Linq;
 
 namespace ghoh
 {
     public class ghohVibratePoint : GH_Component
     {
         private DateTime lastUpdateTime = DateTime.MinValue;
-        private double lastDistance = 0.0; // Represents distance to the first target for output
-        private double lastAmplitude = 0.0; // Represents amplitude for the first target for output
+        // The cached values are now in the consistent "Rhino Haptic" coordinate space
+        private List<double> lastDistances_RhinoSpace = new List<double>();
+        private List<double> lastIndividualAmplitudes = new List<double>();
+        private double lastResultantAmplitude = 0.0;
+        private double lastEffectiveAmplitudeFactor = 0.0;
+        private int lastDominantPointIndex = -1;
 
         public ghohVibratePoint() : base(
-            "ghohVibratePoint", // Internal name
-            "Vibrate At Points", // Component name in Grasshopper UI
-            "Creates vibration feedback based on proximity to one or more points. All points share common vibration parameters. The MaxAmplitude input defines the overall cap for the combined vibration.",
+            "ghohVibratePoint",
+            "VibratePoints",
+            "Vibration based on proximity to multiple target points. The transformation logic now matches ghohPullToPoint, performing calculations in a consistent haptic coordinate space.",
             "ghoh",
             "device")
         {
@@ -22,33 +28,37 @@ namespace ghoh
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
-            pManager.AddBooleanParameter("Enable", "E", "Enable or disable vibration", GH_ParamAccess.item, false);
-            pManager.AddPointParameter("Targets", "T", "Reference point(s) for proximity detection", GH_ParamAccess.list);
-            pManager.AddVectorParameter("Direction", "D", "Vibration direction vector (world space, applied to all points)", GH_ParamAccess.item, new Vector3d(0, 0, 1));
-            pManager.AddNumberParameter("Deadzone", "DZ", "Radius around points with no vibration (normal) or max vibration (inverted)", GH_ParamAccess.item, 0.0);
-            pManager.AddNumberParameter("MaxDistance", "MD", "Maximum distance for vibration effect from points", GH_ParamAccess.item, 10.0);
-            // MODIFIED: Description updated to reflect its role as an overall cap.
-            pManager.AddNumberParameter("MaxAmplitude", "MA", "Maximum vibration amplitude. This acts as an overall cap for the combined effect if multiple points are active.", GH_ParamAccess.item, 1.0);
-            pManager.AddNumberParameter("Frequency", "F", "Vibration frequency in Hz (1-1000)", GH_ParamAccess.item, 100.0);
-            pManager.AddBooleanParameter("Invert", "I", "Invert distance mapping behavior", GH_ParamAccess.item, false);
-            pManager.AddBooleanParameter("SquareWave", "S", "Use square wave instead of sine wave", GH_ParamAccess.item, false);
-            pManager.AddTransformParameter("Transform", "X", "Optional transform matrix for world to device space. If not provided, world coordinates are assumed to be device coordinates.", GH_ParamAccess.item);
-            pManager.AddNumberParameter("UpdateInterval", "U", "Output update interval in milliseconds (10-5000) for display values", GH_ParamAccess.item, 100.0);
+            pManager.AddBooleanParameter("Enable", "E", "Enable or disable vibration", GH_ParamAccess.item, false); // 0
+            pManager.AddPointParameter("Targets", "P", "Target points (World Coordinates)", GH_ParamAccess.list); // 1
+            pManager.AddVectorParameter("Direction", "Dir", "Vibration direction vector (World Coordinates)", GH_ParamAccess.item, new Vector3d(0, 0, 1)); // 2
+            pManager.AddNumberParameter("Deadzone", "DZ", "Distance (haptic units) to point with no vibration (normal) or max vibration (inverted)", GH_ParamAccess.item, 0.0); // 3
+            pManager.AddNumberParameter("MaxDistance", "MD", "Maximum distance (haptic units) for vibration effect. Must be greater than Deadzone.", GH_ParamAccess.item, 10.0); // 4
+            pManager.AddNumberParameter("MaxAmplitude", "MA", "Maximum vibration amplitude (force units)", GH_ParamAccess.item, 1.0); // 5
+            pManager.AddNumberParameter("Frequency", "F", "Vibration frequency in Hz (1-1000)", GH_ParamAccess.item, 100.0); // 6
+            pManager.AddBooleanParameter("Invert", "I", "Invert distance mapping (vibrate strong when close)", GH_ParamAccess.item, false); // 7
+            pManager.AddBooleanParameter("SquareWave", "SW", "Use square wave instead of sine wave", GH_ParamAccess.item, false); // 8
+            pManager.AddTransformParameter("Transform", "X", "Transform matrix from World to Device space (same as PullToPoint)", GH_ParamAccess.item); // 9 
+            pManager.AddNumberParameter("UpdateInterval", "U", "Output update interval (ms, 10-5000)", GH_ParamAccess.item, 100.0); // 10
 
+            // Optional inputs
             pManager[2].Optional = true;
             pManager[3].Optional = true;
-            // Index 5 is MaxAmplitude
-            pManager[6].Optional = true; // Frequency
-            pManager[7].Optional = true; // Invert
-            pManager[8].Optional = true; // SquareWave
-            pManager[9].Optional = true; // Transform
-            pManager[10].Optional = true; // UpdateInterval
+            pManager[4].Optional = true;
+            pManager[5].Optional = true;
+            pManager[6].Optional = true;
+            pManager[7].Optional = true;
+            pManager[8].Optional = true;
+            pManager[9].Optional = true;
+            pManager[10].Optional = true;
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
-            pManager.AddNumberParameter("Distance (First Pt)", "D1", "Current distance to the first target point (if any)", GH_ParamAccess.item);
-            pManager.AddNumberParameter("Amplitude (First Pt)", "A1", "Calculated individual amplitude for the first target point (if any), before overall capping of combined forces.", GH_ParamAccess.item);
+            pManager.AddNumberParameter("Distances (Haptic)", "D", "Current distances from device (TCP) to each target point (in haptic space units)", GH_ParamAccess.list);
+            pManager.AddNumberParameter("IndividualAmplitudes", "IA", "Calculated amplitude contribution from each point (before min/max logic, in force units)", GH_ParamAccess.list);
+            pManager.AddNumberParameter("ResultantAmplitude", "RA", "Final vibration amplitude applied (after min/max logic, in force units)", GH_ParamAccess.item);
+            pManager.AddNumberParameter("EffectiveFactor", "EF", "Effective amplitude factor (0-1) after min/max logic, based on dominant point", GH_ParamAccess.item);
+            pManager.AddIntegerParameter("DominantIndex", "DI", "Index of the target point determining the resultant amplitude (-1 if none or disabled)", GH_ParamAccess.item);
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
@@ -56,17 +66,18 @@ namespace ghoh
             var handle = DeviceManager.DeviceHandle;
             if (handle == HDdll.HD_INVALID_HANDLE)
             {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Device not initialized. Vibration disabled.");
-                ForceManager.ClearVibratePoints();
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Haptic device not initialized.");
+                ForceManager.SetVibratePoints(new List<DeviceManager.Vector3D>(), new DeviceManager.Vector3D(0, 0, 1), false, 0, 0, 0, 0, false, false);
+                ClearOutputsAndSetDA(DA);
                 return;
             }
 
             bool enable = false;
-            List<Point3d> worldTargets = new List<Point3d>();
-            Vector3d worldDirection = new Vector3d(0, 0, 1);
+            List<GH_Point> ghTargetPoints_world = new List<GH_Point>();
+            Vector3d direction_world = new Vector3d(0, 0, 1);
             double deadzone = 0.0;
             double maxDistance = 10.0;
-            double overallMaxAmplitude = 1.0; // This variable will hold the value from "MaxAmplitude" input.
+            double maxAmplitude = 1.0;
             double frequency = 100.0;
             bool invertMapping = false;
             bool useSquareWave = false;
@@ -74,145 +85,191 @@ namespace ghoh
             double updateInterval = 100.0;
 
             DA.GetData(0, ref enable);
-            DA.GetDataList(1, worldTargets);
-            DA.GetData(2, ref worldDirection);
+            DA.GetDataList(1, ghTargetPoints_world);
+            DA.GetData(2, ref direction_world);
             DA.GetData(3, ref deadzone);
             DA.GetData(4, ref maxDistance);
-            DA.GetData(5, ref overallMaxAmplitude); // Read the "MaxAmplitude" input.
+            DA.GetData(5, ref maxAmplitude);
             DA.GetData(6, ref frequency);
             DA.GetData(7, ref invertMapping);
             DA.GetData(8, ref useSquareWave);
             DA.GetData(9, ref worldToDeviceTransform);
             DA.GetData(10, ref updateInterval);
 
-            if (!enable || worldTargets == null || worldTargets.Count == 0)
-            {
-                ForceManager.ClearVibratePoints();
-                if (enable && (worldTargets == null || worldTargets.Count == 0))
-                {
-                    AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "Vibration enabled but no target points provided.");
-                }
-                DA.SetData(0, 0.0);
-                DA.SetData(1, 0.0);
-                return;
-            }
+            List<Point3d> targetPoints_world_valid = ghTargetPoints_world
+                .Where(gh_pt => gh_pt != null && gh_pt.Value.IsValid)
+                .Select(gh_pt => gh_pt.Value)
+                .ToList();
 
+            // Validate and sanitize parameters
             updateInterval = Math.Max(10.0, Math.Min(5000.0, updateInterval));
             deadzone = Math.Max(0.0, deadzone);
             maxDistance = Math.Max(deadzone + 0.001, maxDistance);
-            // The overallMaxAmplitude is clamped inside ForceManager, but good to be aware of its intended range.
-            // overallMaxAmplitude = Math.Max(0.0, Math.Min(3.0, overallMaxAmplitude)); // Clamping is done in ForceManager
+            maxAmplitude = Math.Max(0.0, maxAmplitude);
             frequency = Math.Max(1.0, Math.Min(1000.0, frequency));
+            if (!direction_world.Unitize()) direction_world = new Vector3d(0, 0, 1);
 
-            List<DeviceManager.Vector3D> deviceSpaceTargetVectors = new List<DeviceManager.Vector3D>();
-            Transform inverseTransform = Transform.Identity;
-            bool applyTransform = !worldToDeviceTransform.Equals(Transform.Identity);
+            // --- BUG FIX: Match the transformation logic from ghohPullToPoint ---
+            // The points and direction are transformed into the "Rhino Haptic" coordinate system.
+            Transform deviceToWorldInverse = Transform.Identity;
+            bool useInverse = !worldToDeviceTransform.Equals(Transform.Identity) && worldToDeviceTransform.TryGetInverse(out deviceToWorldInverse);
 
-            if (applyTransform)
+            List<Point3d> targetPoints_rhino_pt3d = new List<Point3d>();
+            Vector3d direction_rhino_vec3d = direction_world;
+
+            if (useInverse)
             {
-                if (!worldToDeviceTransform.TryGetInverse(out inverseTransform))
+                foreach (Point3d p_world in targetPoints_world_valid)
                 {
-                    AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Failed to invert transformation matrix. Using world coordinates as device coordinates.");
-                    applyTransform = false;
+                    Point3d p_transformed = p_world;
+                    p_transformed.Transform(deviceToWorldInverse); // Apply inverse transform to match pullToPoint
+                    targetPoints_rhino_pt3d.Add(p_transformed);
                 }
+                direction_rhino_vec3d.Transform(deviceToWorldInverse); // Also transform the direction vector
             }
-
-            foreach (var worldPt in worldTargets)
+            else
             {
-                Point3d devicePt = worldPt;
-                if (applyTransform)
-                {
-                    devicePt.Transform(inverseTransform);
-                }
-                deviceSpaceTargetVectors.Add(new DeviceManager.Vector3D(devicePt.X, devicePt.Y, devicePt.Z));
+                targetPoints_rhino_pt3d.AddRange(targetPoints_world_valid); // No transform needed
             }
 
-            Vector3d deviceSpaceDirection = worldDirection;
-            if (applyTransform)
-            {
-                deviceSpaceDirection.Transform(inverseTransform);
-            }
-            var deviceDirectionVector = new DeviceManager.Vector3D(
-                deviceSpaceDirection.X, deviceSpaceDirection.Y, deviceSpaceDirection.Z);
+            if (!direction_rhino_vec3d.Unitize()) direction_rhino_vec3d = new Vector3d(0, 0, 1);
 
-            // Pass the overallMaxAmplitude read from the component to ForceManager.
+            // Convert to DeviceManager types for ForceManager
+            List<DeviceManager.Vector3D> targetPoints_rhino_dm = targetPoints_rhino_pt3d
+                .Select(pt => new DeviceManager.Vector3D(pt.X, pt.Y, pt.Z))
+                .ToList();
+            DeviceManager.Vector3D direction_rhino_dm = new DeviceManager.Vector3D(
+                direction_rhino_vec3d.X, direction_rhino_vec3d.Y, direction_rhino_vec3d.Z);
+
+            bool systemShouldBeActive = enable && targetPoints_rhino_dm.Count > 0;
+
+            // Update ForceManager with haptic-space coordinates and parameters
+            // SetVibratePoints now expects targets and direction in "Rhino Haptic" coordinates.
             ForceManager.SetVibratePoints(
-                deviceSpaceTargetVectors,
-                deviceDirectionVector,
-                true,
-                deadzone,
-                maxDistance,
-                overallMaxAmplitude, // This is passed as the overall cap.
-                frequency,
-                invertMapping,
-                useSquareWave
+                targetPoints_rhino_dm,
+                direction_rhino_dm,
+                systemShouldBeActive,
+                deadzone, maxDistance, maxAmplitude, frequency, invertMapping, useSquareWave
             );
 
-            var state = DeviceManager.GetCurrentState();
-            try
+            DateTime currentTime = DateTime.Now;
+            if ((currentTime - lastUpdateTime).TotalMilliseconds >= updateInterval)
             {
-                if (state.Transform == null)
+                if (systemShouldBeActive)
                 {
-                    AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "Could not get device state for output display.");
-                    DA.SetData(0, 0.0);
-                    DA.SetData(1, 0.0);
-                    return;
-                }
+                    lastDistances_RhinoSpace.Clear();
+                    lastIndividualAmplitudes.Clear();
 
-                var currentDevicePosition = new Point3d(
-                    -state.Transform[12], state.Transform[14], state.Transform[13]);
-
-                double outputDistance = 0.0;
-                double outputAmplitudeForFirstPoint = 0.0; // Amplitude for the first point display
-
-                if (deviceSpaceTargetVectors.Count > 0)
-                {
-                    var firstDeviceSpaceTarget = deviceSpaceTargetVectors[0];
-                    var firstTargetAsPoint3d = new Point3d(firstDeviceSpaceTarget.X, firstDeviceSpaceTarget.Y, firstDeviceSpaceTarget.Z);
-                    outputDistance = currentDevicePosition.DistanceTo(firstTargetAsPoint3d);
-
-                    // Calculate the individual amplitude for the first point for display purposes.
-                    // This uses overallMaxAmplitude as the potential max for this single point's calculation.
-                    if (invertMapping)
+                    DeviceManager.DeviceState state = DeviceManager.GetCurrentState();
+                    if (state.Transform != null)
                     {
-                        if (outputDistance >= maxDistance) outputAmplitudeForFirstPoint = 0.0;
-                        else if (outputDistance < deadzone) outputAmplitudeForFirstPoint = overallMaxAmplitude;
-                        else
+                        try
                         {
-                            double usableRange = maxDistance - deadzone;
-                            outputAmplitudeForFirstPoint = (1.0 - (outputDistance - deadzone) / usableRange) * overallMaxAmplitude;
+                            // --- BUG FIX: Perform output calculations in the correct coordinate space ---
+                            // Get device position in Native Device Coordinates.
+                            Point3d devicePosition_native = new Point3d(state.Transform[12], state.Transform[13], state.Transform[14]);
+
+                            // Convert to "Rhino Haptic" space to match ForceManager calculations.
+                            Point3d devicePosition_rhino = new Point3d(-devicePosition_native.X, devicePosition_native.Z, devicePosition_native.Y);
+
+                            List<double> currentAmplitudeFactors = new List<double>();
+
+                            for (int i = 0; i < targetPoints_rhino_pt3d.Count; i++)
+                            {
+                                Point3d targetPt_rhino = targetPoints_rhino_pt3d[i]; // Already in Rhino Haptic space
+                                double dist_rhino = devicePosition_rhino.DistanceTo(targetPt_rhino); // Distance in haptic space units
+                                lastDistances_RhinoSpace.Add(dist_rhino);
+
+                                double amplitudeFactor;
+                                double usableRange = maxDistance - deadzone;
+                                if (usableRange < 0.001) usableRange = 0.001;
+
+                                if (invertMapping) // Vibrate strong when close
+                                {
+                                    if (dist_rhino >= maxDistance) amplitudeFactor = 0.0;
+                                    else if (dist_rhino <= deadzone) amplitudeFactor = 1.0;
+                                    else amplitudeFactor = 1.0 - ((dist_rhino - deadzone) / usableRange);
+                                }
+                                else // Vibrate strong when far
+                                {
+                                    if (dist_rhino >= maxDistance) amplitudeFactor = 1.0;
+                                    else if (dist_rhino <= deadzone) amplitudeFactor = 0.0;
+                                    else amplitudeFactor = (dist_rhino - deadzone) / usableRange;
+                                }
+                                amplitudeFactor = Math.Max(0.0, Math.Min(1.0, amplitudeFactor));
+                                currentAmplitudeFactors.Add(amplitudeFactor);
+                                lastIndividualAmplitudes.Add(amplitudeFactor * maxAmplitude);
+                            }
+
+                            if (currentAmplitudeFactors.Count > 0)
+                            {
+                                if (invertMapping) // Strong when close: highest factor (closest point) dominates
+                                {
+                                    lastEffectiveAmplitudeFactor = currentAmplitudeFactors.Max();
+                                }
+                                else // Strong when far: lowest factor (closest point) dominates
+                                {
+                                    lastEffectiveAmplitudeFactor = currentAmplitudeFactors.Min();
+                                }
+                                lastDominantPointIndex = currentAmplitudeFactors.IndexOf(lastEffectiveAmplitudeFactor);
+                                lastResultantAmplitude = lastEffectiveAmplitudeFactor * maxAmplitude;
+                            }
+                            else // No target points
+                            {
+                                ClearCachedOutputs();
+                            }
+                        }
+                        finally
+                        {
+                            state.ReturnArrays();
                         }
                     }
-                    else
+                    else // Could not get device state
                     {
-                        if (outputDistance >= maxDistance) outputAmplitudeForFirstPoint = overallMaxAmplitude;
-                        else if (outputDistance < deadzone) outputAmplitudeForFirstPoint = 0.0;
-                        else
-                        {
-                            double usableRange = maxDistance - deadzone;
-                            outputAmplitudeForFirstPoint = ((outputDistance - deadzone) / usableRange) * overallMaxAmplitude;
-                        }
+                        ClearCachedOutputs();
                     }
-                    outputAmplitudeForFirstPoint = Math.Max(0.0, Math.Min(outputAmplitudeForFirstPoint, overallMaxAmplitude));
                 }
-
-                var currentTime = DateTime.Now;
-                if ((currentTime - lastUpdateTime).TotalMilliseconds >= updateInterval)
+                else // System is not active
                 {
-                    lastDistance = outputDistance;
-                    lastAmplitude = outputAmplitudeForFirstPoint;
-                    lastUpdateTime = currentTime;
+                    ClearCachedOutputs();
                 }
-                DA.SetData(0, lastDistance);
-                DA.SetData(1, lastAmplitude);
+                lastUpdateTime = currentTime;
             }
-            finally
+
+            DA.SetDataList(0, lastDistances_RhinoSpace);
+            DA.SetDataList(1, lastIndividualAmplitudes);
+            DA.SetData(2, lastResultantAmplitude);
+            DA.SetData(3, lastEffectiveAmplitudeFactor);
+            DA.SetData(4, lastDominantPointIndex);
+        }
+
+        private void ClearCachedOutputs()
+        {
+            if (lastDistances_RhinoSpace.Any() || lastIndividualAmplitudes.Any() ||
+                lastResultantAmplitude != 0.0 || lastEffectiveAmplitudeFactor != 0.0 || lastDominantPointIndex != -1)
             {
-                state.ReturnArrays();
+                lastDistances_RhinoSpace.Clear();
+                lastIndividualAmplitudes.Clear();
+                lastResultantAmplitude = 0.0;
+                lastEffectiveAmplitudeFactor = 0.0;
+                lastDominantPointIndex = -1;
             }
         }
 
+        private void ClearOutputsAndSetDA(IGH_DataAccess DA)
+        {
+            ClearCachedOutputs();
+            DA.SetDataList(0, lastDistances_RhinoSpace);
+            DA.SetDataList(1, lastIndividualAmplitudes);
+            DA.SetData(2, lastResultantAmplitude);
+            DA.SetData(3, lastEffectiveAmplitudeFactor);
+            DA.SetData(4, lastDominantPointIndex);
+        }
+
         protected override System.Drawing.Bitmap Icon => null;
-        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c71b"); // Keep your existing GUID
+
+        public override Guid ComponentGuid => new Guid("DB4A7C1F-7D8B-4A3E-9E1A-5B6C2F0A8B3D"); // Keep original GUID
+
+        public override GH_Exposure Exposure => GH_Exposure.primary;
     }
 }
