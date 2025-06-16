@@ -479,7 +479,26 @@ namespace ghoh
                     double travelParam = FindParameterAtLengthInternal(pullToCurve_RhinoCoords, travelingPointLengthPosition);
                     Point3d targetPt_r = pullToCurve_RhinoCoords.PointAt(travelParam);
                     alongDir_r = targetPt_r - closestPt_r;
-                    alongMag_r = tangentForceMagnitudeFactor;
+
+                    // --- MODIFICATION START ---
+                    // Instead of a constant force, implement a spring-like force towards the traveling point.
+                    // This prevents oscillation when the user reaches the traveling point.
+                    double distToTarget = alongDir_r.Length;
+
+                    if (distToTarget < 0.001)
+                    {
+                        alongMag_r = 0; // No force if we are at the target.
+                    }
+                    else
+                    {
+                        // Calculate spring-like force.
+                        // The force ramps up linearly to `tangentForceMagnitudeFactor` (max force for this effect)
+                        // over the `maxDistanceValueCurve` (the general max distance for the component).
+                        // This mirrors the behavior of the PullToPoint component.
+                        double forceScale = Math.Min(1.0, distToTarget / maxDistanceValueCurve);
+                        alongMag_r = tangentForceMagnitudeFactor * forceScale;
+                    }
+                    // --- MODIFICATION END ---
                 }
                 if (alongDir_r.SquareLength > 1e-6 && alongMag_r > 0.001)
                 {
