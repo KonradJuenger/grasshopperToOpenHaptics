@@ -9,6 +9,7 @@ namespace ghoh
 {
     public static class ForceManager
     {
+        #region Existing Force Properties
         // General state
         private static double[] currentTotalForce = new double[3];
 
@@ -120,14 +121,44 @@ namespace ghoh
 
         private static DateTime lastForceUpdateTime = DateTime.Now;
 
+        #endregion Existing Force Properties
+
+        // --- NEW: "Lazy String" / Pulled String parameters ---
+        private static bool lazyStringEnabled = false;
+        private static double stringLength = 20.0; // The radius of the "slack" area, in native device units (mm).
+        private static double returnForce = 1.5;   // The force magnitude (Newtons) the user feels when the string is taut.
+        private static DeviceManager.Vector3D tooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
+        private static bool isFirstLazyStringFrame = true; // Flag to handle initialization.
+        // --- End of New Parameters ---
+
         public static DeviceManager.Vector3D CurrentDeviceTCP_NativeCoords { get; private set; } = new DeviceManager.Vector3D();
 
+        /// <summary>
+        /// Public property to expose the virtual cursor's position for reading by other components.
+        /// </summary>
+        public static DeviceManager.Vector3D TooltipPosition_Native { get; private set; } = new DeviceManager.Vector3D();
+
+        // --- NEW: Public method to control the Lazy String effect ---
+        public static void SetLazyStringEffect(bool enable, double length, double force)
+        {
+            if (enable && !lazyStringEnabled)
+            {
+                // When the effect is first enabled, reset the virtual cursor's state
+                // to match the current device position to avoid a sudden jump.
+                isFirstLazyStringFrame = true;
+            }
+            lazyStringEnabled = enable;
+            stringLength = Math.Max(0, length);
+            returnForce = Math.Max(0, force);
+        }
+        // --- End of New Method ---
 
         public static double[] GetCurrentForce()
         {
             return (double[])currentTotalForce.Clone();
         }
 
+        #region Existing Force Calculation Methods
         public static Vector3d SetViscousDamping(bool enable, double gain, double maxForce, double deadbandThreshold = 10.0, double softness = 5.0, double filterCoefficient = 0.9, int windowSize = 10)
         {
             viscousDampingEnabled = enable;
@@ -480,25 +511,17 @@ namespace ghoh
                     Point3d targetPt_r = pullToCurve_RhinoCoords.PointAt(travelParam);
                     alongDir_r = targetPt_r - closestPt_r;
 
-                    // --- MODIFICATION START ---
-                    // Instead of a constant force, implement a spring-like force towards the traveling point.
-                    // This prevents oscillation when the user reaches the traveling point.
                     double distToTarget = alongDir_r.Length;
 
                     if (distToTarget < 0.001)
                     {
-                        alongMag_r = 0; // No force if we are at the target.
+                        alongMag_r = 0;
                     }
                     else
                     {
-                        // Calculate spring-like force.
-                        // The force ramps up linearly to `tangentForceMagnitudeFactor` (max force for this effect)
-                        // over the `maxDistanceValueCurve` (the general max distance for the component).
-                        // This mirrors the behavior of the PullToPoint component.
                         double forceScale = Math.Min(1.0, distToTarget / maxDistanceValueCurve);
                         alongMag_r = tangentForceMagnitudeFactor * forceScale;
                     }
-                    // --- MODIFICATION END ---
                 }
                 if (alongDir_r.SquareLength > 1e-6 && alongMag_r > 0.001)
                 {
@@ -601,7 +624,6 @@ namespace ghoh
             }
             ampFactor = Math.Max(0.0, Math.Min(1.0, ampFactor));
 
-            // This property is for the GH component output. It shows the scaled intensity.
             vibrationCurveAmplitude = vibrationCurveMaxAmplitude * ampFactor;
 
             if (vibrationCurveMode != Vibration.VibrationMode.Pulse && vibrationCurveAmplitude < 0.0001)
@@ -611,8 +633,6 @@ namespace ghoh
                 return new double[] { 0, 0, 0 };
             }
 
-            // For pulse mode, we need an effect even if ampFactor is zero (to get the max pause).
-            // For other modes, a zero amplitude factor means no force.
             if (vibrationCurveMode != Vibration.VibrationMode.Pulse && ampFactor < 0.0001)
             {
                 vibrationCurveAmplitude = 0;
@@ -620,7 +640,6 @@ namespace ghoh
                 vibrationCurveCalcTime = curveCalcStopwatch.Elapsed.TotalMilliseconds;
                 return new double[] { 0, 0, 0 };
             }
-
 
             double currentPause = vibrationCurveMinPause + (vibrationCurveMaxPause - vibrationCurveMinPause) * (1.0 - ampFactor);
 
@@ -631,16 +650,13 @@ namespace ghoh
                 currentPause
             );
 
-            // Determine the effective amplitude for the force calculation itself.
             double effectiveAmplitude;
             if (vibrationCurveMode == Vibration.VibrationMode.Pulse)
             {
-                // For Pulse mode, the vibration strength is always the maximum.
                 effectiveAmplitude = vibrationCurveMaxAmplitude;
             }
             else
             {
-                // For Sine and Square modes, the strength is scaled by distance.
                 effectiveAmplitude = vibrationCurveAmplitude;
             }
 
@@ -736,6 +752,7 @@ namespace ghoh
             return new double[] { -forceVec_Rhino.X, forceVec_Rhino.Z, forceVec_Rhino.Y };
         }
 
+        #endregion Existing Force Calculation Methods
 
         public static void UpdateForces()
         {
@@ -745,40 +762,112 @@ namespace ghoh
 
             double[] totalForceForFrame_NativeDeviceCoords = new double[3] { 0, 0, 0 };
 
+            // 1. Get the REAL physical transform of the device
             var hdTransformMatrix = new double[16];
             HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, hdTransformMatrix);
 
             DeviceManager.Vector3D rawGimbalPos_Native = new DeviceManager.Vector3D(
                 hdTransformMatrix[12], hdTransformMatrix[13], hdTransformMatrix[14]);
 
-            DeviceManager.Vector3D currentTCP_Native = rawGimbalPos_Native;
+            // This is the REAL position of the tool tip, apply offset if any
+            DeviceManager.Vector3D realTCP_Native = rawGimbalPos_Native;
             if (tcpOffset.X != 0 || tcpOffset.Y != 0 || tcpOffset.Z != 0)
             {
                 double ox = tcpOffset.X * hdTransformMatrix[0] + tcpOffset.Y * hdTransformMatrix[4] + tcpOffset.Z * hdTransformMatrix[8];
                 double oy = tcpOffset.X * hdTransformMatrix[1] + tcpOffset.Y * hdTransformMatrix[5] + tcpOffset.Z * hdTransformMatrix[9];
                 double oz = tcpOffset.X * hdTransformMatrix[2] + tcpOffset.Y * hdTransformMatrix[6] + tcpOffset.Z * hdTransformMatrix[10];
-                currentTCP_Native.X = rawGimbalPos_Native.X + ox;
-                currentTCP_Native.Y = rawGimbalPos_Native.Y + oy;
-                currentTCP_Native.Z = rawGimbalPos_Native.Z + oz;
+                realTCP_Native.X += ox;
+                realTCP_Native.Y += oy;
+                realTCP_Native.Z += oz;
             }
-            CurrentDeviceTCP_NativeCoords = currentTCP_Native;
 
+            // The position that will be used for all environmental interactions
+            DeviceManager.Vector3D interactionPosition_Native;
+
+            // 2. *** MODIFIED: LAZY STRING LOGIC ***
+            if (lazyStringEnabled)
+            {
+                // On the first frame of enabling, snap the tooltip to the real cursor's position.
+                if (isFirstLazyStringFrame)
+                {
+                    tooltipPosition_Native = realTCP_Native;
+                    isFirstLazyStringFrame = false;
+                }
+
+                // Calculate vector and distance from the tooltip to the real cursor.
+                double dx = realTCP_Native.X - tooltipPosition_Native.X;
+                double dy = realTCP_Native.Y - tooltipPosition_Native.Y;
+                double dz = realTCP_Native.Z - tooltipPosition_Native.Z;
+                double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                // Check if the string is taut
+                if (distance > stringLength)
+                {
+                    // The string is taut.
+                    double overshoot = distance - stringLength;
+
+                    // The direction to move the tooltip is from the old tooltip position towards the real cursor.
+                    if (distance > 0.001)
+                    {
+                        var direction = new DeviceManager.Vector3D(dx / distance, dy / distance, dz / distance);
+
+                        // Move the tooltip by the amount of overshoot in the pull direction.
+                        tooltipPosition_Native.X += direction.X * overshoot;
+                        tooltipPosition_Native.Y += direction.Y * overshoot;
+                        tooltipPosition_Native.Z += direction.Z * overshoot;
+                    }
+
+
+                    // --- Calculate Haptic Force ---
+                    // The force pushes the user's hand back towards the tooltip.
+                    // The direction is from the real cursor back to the (new) tooltip position.
+                    double forceDirX = tooltipPosition_Native.X - realTCP_Native.X;
+                    double forceDirY = tooltipPosition_Native.Y - realTCP_Native.Y;
+                    double forceDirZ = tooltipPosition_Native.Z - realTCP_Native.Z;
+                    double forceDirMag = Math.Sqrt(forceDirX * forceDirX + forceDirY * forceDirY + forceDirZ * forceDirZ);
+
+                    // Normalize the force direction vector
+                    if (forceDirMag > 0.001)
+                    {
+                        forceDirX /= forceDirMag;
+                        forceDirY /= forceDirMag;
+                        forceDirZ /= forceDirMag;
+                    }
+
+                    var hapticForce = new double[3] {
+                        forceDirX * returnForce,
+                        forceDirY * returnForce,
+                        forceDirZ * returnForce
+                    };
+                    for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += hapticForce[i];
+                }
+
+                // For all other interactions, use the tooltip's position.
+                interactionPosition_Native = tooltipPosition_Native;
+            }
+            else
+            {
+                // If the effect is disabled, the interaction position is just the real position.
+                interactionPosition_Native = realTCP_Native;
+            }
+
+            // 3. Update the public properties for other components to read
+            CurrentDeviceTCP_NativeCoords = interactionPosition_Native;
+            TooltipPosition_Native = tooltipPosition_Native; // Expose the virtual position
+
+            // Convert the interaction position to Rhino coords for all other force calculations
             DeviceManager.Vector3D currentTCP_RhinoCoords = new DeviceManager.Vector3D(
-                -currentTCP_Native.X, currentTCP_Native.Z, currentTCP_Native.Y);
+                -CurrentDeviceTCP_NativeCoords.X, CurrentDeviceTCP_NativeCoords.Z, CurrentDeviceTCP_NativeCoords.Y);
 
 
-            // --- Accumulate forces ---
+            // --- Accumulate OTHER forces (now using the correct interaction position) ---
             if (viscousDampingEnabled) { var f = CalculateViscousForce_Native(); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
-
             if (vibrationCurveEnabled) { var f = CalculateVibrationCurveForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
-
             if (vibrationPointSystemEnabled) { var f = CalculateVibrationPointForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
-
             if (planeCollisionEnabled) { var f = CalculatePlaneCollisionForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (multiPullToPointEnabled) { if (smoothingEnabledMultiPoint) UpdateSmoothedTargets(); var f = CalculateMultiPullToPointForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (pullToCurveEnabled) { var f = CalculatePullToCurveForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (pullToPlaneEnabled) { var f = CalculatePullToPlaneForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
-
             if (filteredForceEnabled && forceFilter != null) { for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += lastFilteredForce[i]; }
             else if (directForceEnabled) { for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += currentDirectForce[i]; }
 
@@ -862,6 +951,14 @@ namespace ghoh
             tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
             CurrentDeviceTCP_NativeCoords = new DeviceManager.Vector3D(0, 0, 0);
             Vibration.Reset();
+
+            // --- NEW: Reset Lazy String state ---
+            lazyStringEnabled = false;
+            isFirstLazyStringFrame = true;
+            tooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
+            TooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
+            // --- End of Reset ---
+
             currentTotalForce = new double[3] { 0, 0, 0 };
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, currentTotalForce);
         }

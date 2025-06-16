@@ -7,33 +7,38 @@ namespace ghoh
 {
     public class ghohRead : GH_Component
     {
-        public ghohRead() : base("ghohRead", "read", "Reads data from the haptic device with optional TCP offset", "ghoh", "device")
+        public ghohRead() : base("ghohRead", "Read",
+            "Reads data from the haptic device. Includes different interaction modes.",
+            "ghoh", "device")
         {
         }
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
+            pManager.AddIntegerParameter("Mode", "M", "Interaction mode:\n0 = Standard (direct control)\n1 = Lazy String", GH_ParamAccess.item, 0);
             pManager.AddTransformParameter("Transform", "X", "Optional transform matrix for scaling and additional transformations", GH_ParamAccess.item);
             pManager.AddVectorParameter("TCPOffset", "O", "Optional offset vector from TCP in local device coordinates", GH_ParamAccess.item, Vector3d.Zero);
-            pManager[0].Optional = true;
+
+            // Inputs for Lazy String Mode
+            pManager.AddNumberParameter("StringLength", "L", "[Lazy String Mode] The radius of the slack zone (mm).", GH_ParamAccess.item, 20.0);
+            pManager.AddNumberParameter("ReturnForce", "F", "[Lazy String Mode] The force feedback (N) when the string is taut.", GH_ParamAccess.item, 1.5);
+
             pManager[1].Optional = true;
+            pManager[2].Optional = true;
+            pManager[3].Optional = true;
+            pManager[4].Optional = true;
         }
 
         protected override void RegisterOutputParams(GH_OutputParamManager pManager)
         {
-            pManager.AddPlaneParameter("Plane", "P", "Output Plane", GH_ParamAccess.item);
+            pManager.AddPlaneParameter("Real Cursor", "P_Real", "The real-time plane of the physical haptic device.", GH_ParamAccess.item);
+            pManager.AddPlaneParameter("Virtual Cursor", "P_Virt", "The plane of the virtual cursor, used for interactions in non-standard modes.", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Button 1 Status", "B1", "Output Button 1 Status", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Button 2 Status", "B2", "Output Button 2 Status", GH_ParamAccess.item);
-           // pManager.AddTransformParameter("Raw Transform", "RT", "Raw 4×4 transformation matrix", GH_ParamAccess.item);
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            Transform additionalTransform = Transform.Identity;
-            Vector3d tcpOffset = Vector3d.Zero;
-            DA.GetData(0, ref additionalTransform);
-            DA.GetData(1, ref tcpOffset);
-
             int handle = DeviceManager.DeviceHandle;
             if (handle == HDdll.HD_INVALID_HANDLE)
             {
@@ -41,48 +46,99 @@ namespace ghoh
                 return;
             }
 
-            
+            // --- Read all inputs ---
+            int mode = 0;
+            Transform additionalTransform = Transform.Identity;
+            Vector3d tcpOffset = Vector3d.Zero;
+            double stringLength = 20.0;
+            double returnForce = 1.5;
+
+            DA.GetData(0, ref mode);
+            DA.GetData(1, ref additionalTransform);
+            DA.GetData(2, ref tcpOffset);
+            DA.GetData(3, ref stringLength);
+            DA.GetData(4, ref returnForce);
+
+            // --- Set the interaction mode in the ForceManager ---
+            if (mode == 1) // Lazy String Mode
+            {
+                ForceManager.SetLazyStringEffect(true, stringLength, returnForce);
+            }
+            else // Standard Mode (or any other future mode that is disabled by default)
+            {
+                ForceManager.SetLazyStringEffect(false, 0, 0);
+            }
+
+            // --- Process and output data ---
+
+            // Get the raw state of the physical device
             var state = DeviceManager.GetCurrentState();
-            /*
-            var rawTransform = Transform.Identity;
-            rawTransform.M00 = state.Transform[0];
-            rawTransform.M01 = state.Transform[1];
-            rawTransform.M02 = state.Transform[2];
-            rawTransform.M03 = state.Transform[3];
-            rawTransform.M10 = state.Transform[4];
-            rawTransform.M11 = state.Transform[5];
-            rawTransform.M12 = state.Transform[6];
-            rawTransform.M13 = state.Transform[7];
-            rawTransform.M20 = state.Transform[8];
-            rawTransform.M21 = state.Transform[9];
-            rawTransform.M22 = state.Transform[10];
-            rawTransform.M23 = state.Transform[11];
-            rawTransform.M30 = state.Transform[12];
-            rawTransform.M31 = state.Transform[13];
-            rawTransform.M32 = state.Transform[14];
-            rawTransform.M33 = state.Transform[15];
+            if (state.Transform == null)
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "Could not retrieve device state.");
+                return;
+            }
 
+            // --- Calculate the REAL cursor plane ---
+            Plane realPlane = CalculatePlaneFromTransform(state.Transform, tcpOffset, additionalTransform);
 
-            // Set the output
-            DA.SetData(3, rawTransform);
-            */
-            // Create initial plane from cached state
+            // --- Calculate the VIRTUAL cursor plane ---
+            Plane virtualPlane;
+            if (mode == 1)
+            {
+                // In Lazy String mode, get the virtual position from the Force Manager
+                var virtualPosNative = ForceManager.TooltipPosition_Native;
+
+                // We need the orientation from the REAL device to construct a plane for the virtual point
+                var tempTransform = (double[])state.Transform.Clone();
+                tempTransform[12] = virtualPosNative.X;
+                tempTransform[13] = virtualPosNative.Y;
+                tempTransform[14] = virtualPosNative.Z;
+
+                // Note: TCP offset is not applied to the virtual cursor, as it's part of the real device setup
+                virtualPlane = CalculatePlaneFromTransform(tempTransform, Vector3d.Zero, additionalTransform);
+            }
+            else
+            {
+                // In standard mode, the virtual cursor is the same as the real one.
+                virtualPlane = realPlane;
+            }
+
+            // Get button status
+            bool button1Status = (state.Buttons & 0x01) != 0;
+            bool button2Status = (state.Buttons & 0x02) != 0;
+
+            // Set all outputs
+            DA.SetData(0, realPlane);
+            DA.SetData(1, virtualPlane);
+            DA.SetData(2, button1Status);
+            DA.SetData(3, button2Status);
+
+            // IMPORTANT: Return the array from GetCurrentState to the pool
+            state.ReturnArrays();
+        }
+
+        /// <summary>
+        /// Helper function to create a Rhino Plane from a haptic device transform matrix.
+        /// </summary>
+        private Plane CalculatePlaneFromTransform(double[] transform, Vector3d tcpOffset, Transform additionalTransform)
+        {
             var origin = new Point3d(
-                -state.Transform[12],
-                state.Transform[14],
-                state.Transform[13]
+                -transform[12],
+                transform[14],
+                transform[13]
             );
 
             var xDirection = new Vector3d(
-                -state.Transform[0],
-                state.Transform[2],
-                state.Transform[1]
+                -transform[0],
+                transform[2],
+                transform[1]
             );
 
             var yDirection = new Vector3d(
-                -state.Transform[4],
-                state.Transform[6],
-                state.Transform[5]
+                -transform[4],
+                transform[6],
+                transform[5]
             );
 
             var plane = new Plane(origin, xDirection, yDirection);
@@ -90,17 +146,12 @@ namespace ghoh
             // Apply TCP offset if provided
             if (!tcpOffset.IsZero)
             {
-                // Get the plane's coordinate system vectors
-                Vector3d zDirection = Vector3d.CrossProduct(xDirection, yDirection);
-
-                // Create the offset in the plane's coordinate system
-                Vector3d offsetInPlaneSpace =
-                    tcpOffset.X * xDirection +
-                    tcpOffset.Y * yDirection +
+                Vector3d zDirection = plane.ZAxis; // Use the calculated Z-axis
+                Vector3d offsetInWorldSpace =
+                    tcpOffset.X * plane.XAxis +
+                    tcpOffset.Y * plane.YAxis +
                     tcpOffset.Z * zDirection;
-
-                // Move the plane's origin
-                plane.Origin += offsetInPlaneSpace;
+                plane.Origin += offsetInWorldSpace;
             }
 
             // Apply additional transform if provided
@@ -109,14 +160,7 @@ namespace ghoh
                 plane.Transform(additionalTransform);
             }
 
-            bool button1Status = (state.Buttons & 0x01) != 0;
-            bool button2Status = (state.Buttons & 0x02) != 0;
-
-            DA.SetData(0, plane);
-            DA.SetData(1, button1Status);
-            DA.SetData(2, button2Status);
-
-            state.ReturnArrays();
+            return plane;
         }
 
         protected override System.Drawing.Bitmap Icon => null;
