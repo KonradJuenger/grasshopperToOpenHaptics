@@ -123,35 +123,76 @@ namespace ghoh
 
         #endregion Existing Force Properties
 
-        // --- NEW: "Lazy String" / Pulled String parameters ---
+        // --- "Lazy String" / Pulled String parameters ---
         private static bool lazyStringEnabled = false;
-        private static double stringLength = 20.0; // The radius of the "slack" area, in native device units (mm).
-        private static double returnForce = 1.5;   // The force magnitude (Newtons) the user feels when the string is taut.
+        private static double stringLength = 20.0;
+        private static double returnForce = 1.5;
         private static DeviceManager.Vector3D tooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
-        private static bool isFirstLazyStringFrame = true; // Flag to handle initialization.
+        private static bool isFirstLazyStringFrame = true;
+
+        // --- "Dog on a Leash" parameters ---
+        private static bool dogOnLeashEnabled = false;
+        private static Curve dogLeashCurve_RhinoCoords = null;
+        private static double leashLength = 20.0;
+        private static double leashSpringRange = 20.0;
+        private static double leashMaxForce = 1.5;
+        private static double dogSpeed = 10.0;
+        private static double dogCurrentLengthPosition = 0.0;
+        private static double totalDogCurveLength = 0.0;
+        private static DateTime lastDogLeashUpdateTime = DateTime.Now;
+        public static Point3d DogWorldPosition_RhinoCoords { get; private set; } = Point3d.Unset;
+        private static bool wasButton1PressedLastFrame = false; // NEW: State tracking for button press
+        private static Point3d dogFreeSpacePosition_RhinoCoords = Point3d.Unset; // NEW: Position when dragging
         // --- End of New Parameters ---
 
         public static DeviceManager.Vector3D CurrentDeviceTCP_NativeCoords { get; private set; } = new DeviceManager.Vector3D();
 
-        /// <summary>
-        /// Public property to expose the virtual cursor's position for reading by other components.
-        /// </summary>
         public static DeviceManager.Vector3D TooltipPosition_Native { get; private set; } = new DeviceManager.Vector3D();
 
-        // --- NEW: Public method to control the Lazy String effect ---
         public static void SetLazyStringEffect(bool enable, double length, double force)
         {
             if (enable && !lazyStringEnabled)
             {
-                // When the effect is first enabled, reset the virtual cursor's state
-                // to match the current device position to avoid a sudden jump.
                 isFirstLazyStringFrame = true;
             }
             lazyStringEnabled = enable;
             stringLength = Math.Max(0, length);
             returnForce = Math.Max(0, force);
         }
-        // --- End of New Method ---
+
+        public static void SetDogOnLeash(bool enable, Curve curve, double length, double springRange, double force, double speed, bool reset)
+        {
+            dogOnLeashEnabled = enable;
+
+            if (!enable)
+            {
+                dogLeashCurve_RhinoCoords = null;
+                DogWorldPosition_RhinoCoords = Point3d.Unset;
+                return;
+            }
+
+            if (curve == null || !curve.IsValid)
+            {
+                dogOnLeashEnabled = false;
+                dogLeashCurve_RhinoCoords = null;
+                DogWorldPosition_RhinoCoords = Point3d.Unset;
+                return;
+            }
+
+            leashLength = Math.Max(0, length);
+            leashSpringRange = Math.Max(0.001, springRange);
+            leashMaxForce = Math.Max(0, force);
+            dogSpeed = Math.Max(0, speed);
+
+            if (dogLeashCurve_RhinoCoords != curve || reset)
+            {
+                dogLeashCurve_RhinoCoords = curve;
+                totalDogCurveLength = curve.GetLength();
+                dogCurrentLengthPosition = 0.0;
+                lastDogLeashUpdateTime = DateTime.Now;
+                DogWorldPosition_RhinoCoords = dogLeashCurve_RhinoCoords.PointAtLength(0);
+            }
+        }
 
         public static double[] GetCurrentForce()
         {
@@ -754,6 +795,95 @@ namespace ghoh
 
         #endregion Existing Force Calculation Methods
 
+        // --- UPDATED: Dog on a Leash Force Calculation ---
+        private static double[] CalculateDogOnLeashForce_Native(DeviceManager.Vector3D devicePos_Rhino, bool button1Pressed)
+        {
+            if (!dogOnLeashEnabled || dogLeashCurve_RhinoCoords == null || !dogLeashCurve_RhinoCoords.IsValid)
+            {
+                DogWorldPosition_RhinoCoords = Point3d.Unset;
+                return new double[] { 0, 0, 0 };
+            }
+
+            DateTime now = DateTime.Now;
+            double dt = (now - lastDogLeashUpdateTime).TotalSeconds;
+            lastDogLeashUpdateTime = now;
+
+            Point3d devicePoint_Rhino = new Point3d(devicePos_Rhino.X, devicePos_Rhino.Y, devicePos_Rhino.Z);
+
+            // --- Update Dog's Position ---
+            if (button1Pressed)
+            {
+                // On the first frame the button is pressed, "pick up" the dog from the curve.
+                if (!wasButton1PressedLastFrame)
+                {
+                    dogFreeSpacePosition_RhinoCoords = dogLeashCurve_RhinoCoords.PointAtLength(dogCurrentLengthPosition);
+                }
+
+                // Apply lazy string logic to the free-space position.
+                Vector3d vecToUser = devicePoint_Rhino - dogFreeSpacePosition_RhinoCoords;
+                double distToUser = vecToUser.Length;
+
+                if (distToUser > leashLength)
+                {
+                    double overshoot = distToUser - leashLength;
+                    vecToUser.Unitize();
+                    dogFreeSpacePosition_RhinoCoords += vecToUser * overshoot;
+                }
+
+                DogWorldPosition_RhinoCoords = dogFreeSpacePosition_RhinoCoords;
+            }
+            else
+            {
+                // On the first frame the button is released, snap the dog back to the curve.
+                if (wasButton1PressedLastFrame && dogFreeSpacePosition_RhinoCoords.IsValid)
+                {
+                    double closestT;
+                    dogLeashCurve_RhinoCoords.ClosestPoint(dogFreeSpacePosition_RhinoCoords, out closestT);
+                    dogCurrentLengthPosition = dogLeashCurve_RhinoCoords.GetLength(new Interval(dogLeashCurve_RhinoCoords.Domain.Min, closestT));
+                    dogFreeSpacePosition_RhinoCoords = Point3d.Unset; // Invalidate the free-space position.
+                }
+
+                // Autonomous movement logic when not dragging.
+                double movementIncrement = dogSpeed * dt;
+                dogCurrentLengthPosition += movementIncrement;
+
+                if (totalDogCurveLength > 0.001)
+                {
+                    if (dogLeashCurve_RhinoCoords.IsClosed)
+                    {
+                        dogCurrentLengthPosition = (dogCurrentLengthPosition % totalDogCurveLength + totalDogCurveLength) % totalDogCurveLength;
+                    }
+                    else
+                    {
+                        dogCurrentLengthPosition = Math.Max(0, Math.Min(dogCurrentLengthPosition, totalDogCurveLength));
+                    }
+                }
+                DogWorldPosition_RhinoCoords = dogLeashCurve_RhinoCoords.PointAtLength(dogCurrentLengthPosition);
+            }
+
+            // --- Calculate Haptic Force ---
+            double finalDistToUser = devicePoint_Rhino.DistanceTo(DogWorldPosition_RhinoCoords);
+            double forceScale = 0.0;
+            if (finalDistToUser > leashLength)
+            {
+                double overshoot = finalDistToUser - leashLength;
+                forceScale = Math.Min(1.0, overshoot / leashSpringRange);
+            }
+
+            Vector3d forceVec_Rhino = Vector3d.Zero;
+            if (forceScale > 0.001)
+            {
+                double forceMagnitude = leashMaxForce * forceScale;
+                forceVec_Rhino = DogWorldPosition_RhinoCoords - devicePoint_Rhino;
+                forceVec_Rhino.Unitize();
+                forceVec_Rhino *= forceMagnitude;
+            }
+
+            return new double[] { -forceVec_Rhino.X, forceVec_Rhino.Z, forceVec_Rhino.Y };
+        }
+        // --- End of Updated Method ---
+
+
         public static void UpdateForces()
         {
             DateTime currentTime = DateTime.Now;
@@ -762,14 +892,19 @@ namespace ghoh
 
             double[] totalForceForFrame_NativeDeviceCoords = new double[3] { 0, 0, 0 };
 
-            // 1. Get the REAL physical transform of the device
-            var hdTransformMatrix = new double[16];
-            HDdll.hdGetDoublev(HDdll.HD_CURRENT_TRANSFORM, hdTransformMatrix);
+            var state = DeviceManager.GetCurrentState();
+            if (state.Transform == null)
+            {
+                state.ReturnArrays();
+                return;
+            }
+            var hdTransformMatrix = state.Transform;
+            bool button1Pressed = (state.Buttons & 0x01) != 0;
+
 
             DeviceManager.Vector3D rawGimbalPos_Native = new DeviceManager.Vector3D(
                 hdTransformMatrix[12], hdTransformMatrix[13], hdTransformMatrix[14]);
 
-            // This is the REAL position of the tool tip, apply offset if any
             DeviceManager.Vector3D realTCP_Native = rawGimbalPos_Native;
             if (tcpOffset.X != 0 || tcpOffset.Y != 0 || tcpOffset.Z != 0)
             {
@@ -781,52 +916,37 @@ namespace ghoh
                 realTCP_Native.Z += oz;
             }
 
-            // The position that will be used for all environmental interactions
             DeviceManager.Vector3D interactionPosition_Native;
 
-            // 2. *** MODIFIED: LAZY STRING LOGIC ***
             if (lazyStringEnabled)
             {
-                // On the first frame of enabling, snap the tooltip to the real cursor's position.
                 if (isFirstLazyStringFrame)
                 {
                     tooltipPosition_Native = realTCP_Native;
                     isFirstLazyStringFrame = false;
                 }
 
-                // Calculate vector and distance from the tooltip to the real cursor.
                 double dx = realTCP_Native.X - tooltipPosition_Native.X;
                 double dy = realTCP_Native.Y - tooltipPosition_Native.Y;
                 double dz = realTCP_Native.Z - tooltipPosition_Native.Z;
                 double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
-                // Check if the string is taut
                 if (distance > stringLength)
                 {
-                    // The string is taut.
                     double overshoot = distance - stringLength;
-
-                    // The direction to move the tooltip is from the old tooltip position towards the real cursor.
                     if (distance > 0.001)
                     {
                         var direction = new DeviceManager.Vector3D(dx / distance, dy / distance, dz / distance);
-
-                        // Move the tooltip by the amount of overshoot in the pull direction.
                         tooltipPosition_Native.X += direction.X * overshoot;
                         tooltipPosition_Native.Y += direction.Y * overshoot;
                         tooltipPosition_Native.Z += direction.Z * overshoot;
                     }
 
-
-                    // --- Calculate Haptic Force ---
-                    // The force pushes the user's hand back towards the tooltip.
-                    // The direction is from the real cursor back to the (new) tooltip position.
                     double forceDirX = tooltipPosition_Native.X - realTCP_Native.X;
                     double forceDirY = tooltipPosition_Native.Y - realTCP_Native.Y;
                     double forceDirZ = tooltipPosition_Native.Z - realTCP_Native.Z;
                     double forceDirMag = Math.Sqrt(forceDirX * forceDirX + forceDirY * forceDirY + forceDirZ * forceDirZ);
 
-                    // Normalize the force direction vector
                     if (forceDirMag > 0.001)
                     {
                         forceDirX /= forceDirMag;
@@ -841,26 +961,21 @@ namespace ghoh
                     };
                     for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += hapticForce[i];
                 }
-
-                // For all other interactions, use the tooltip's position.
                 interactionPosition_Native = tooltipPosition_Native;
             }
             else
             {
-                // If the effect is disabled, the interaction position is just the real position.
                 interactionPosition_Native = realTCP_Native;
             }
 
-            // 3. Update the public properties for other components to read
             CurrentDeviceTCP_NativeCoords = interactionPosition_Native;
-            TooltipPosition_Native = tooltipPosition_Native; // Expose the virtual position
-
-            // Convert the interaction position to Rhino coords for all other force calculations
+            TooltipPosition_Native = tooltipPosition_Native;
             DeviceManager.Vector3D currentTCP_RhinoCoords = new DeviceManager.Vector3D(
                 -CurrentDeviceTCP_NativeCoords.X, CurrentDeviceTCP_NativeCoords.Z, CurrentDeviceTCP_NativeCoords.Y);
 
 
-            // --- Accumulate OTHER forces (now using the correct interaction position) ---
+            // --- Accumulate OTHER forces ---
+            if (dogOnLeashEnabled) { var f = CalculateDogOnLeashForce_Native(currentTCP_RhinoCoords, button1Pressed); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (viscousDampingEnabled) { var f = CalculateViscousForce_Native(); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (vibrationCurveEnabled) { var f = CalculateVibrationCurveForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (vibrationPointSystemEnabled) { var f = CalculateVibrationPointForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
@@ -894,8 +1009,8 @@ namespace ghoh
             }
             catch (Exception ex) { Debug.WriteLine($"UCManager error: {ex.Message}"); }
 
+            state.ReturnArrays();
 
-            // --- Apply Global Damping ---
             if (dampingEnabled)
             {
                 double[] dampedTotalForce_Native = new double[3];
@@ -935,6 +1050,9 @@ namespace ghoh
                 currentTotalForce = (double[])totalForceForFrame_NativeDeviceCoords.Clone();
                 HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, totalForceForFrame_NativeDeviceCoords);
             }
+
+            // Update the button state for the next frame
+            wasButton1PressedLastFrame = button1Pressed;
         }
 
         public static void Reset()
@@ -952,12 +1070,16 @@ namespace ghoh
             CurrentDeviceTCP_NativeCoords = new DeviceManager.Vector3D(0, 0, 0);
             Vibration.Reset();
 
-            // --- NEW: Reset Lazy String state ---
             lazyStringEnabled = false;
             isFirstLazyStringFrame = true;
             tooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
             TooltipPosition_Native = new DeviceManager.Vector3D(0, 0, 0);
-            // --- End of Reset ---
+
+            dogOnLeashEnabled = false;
+            dogLeashCurve_RhinoCoords = null;
+            DogWorldPosition_RhinoCoords = Point3d.Unset;
+            dogFreeSpacePosition_RhinoCoords = Point3d.Unset;
+            wasButton1PressedLastFrame = false;
 
             currentTotalForce = new double[3] { 0, 0, 0 };
             HDdll.hdSetDoublev(HDdll.HD_CURRENT_FORCE, currentTotalForce);

@@ -8,7 +8,7 @@ namespace ghoh
     public class ghohRead : GH_Component
     {
         public ghohRead() : base("ghohRead", "Read",
-            "Reads data from the haptic device. Includes different interaction modes.",
+            "Reads data from the haptic device. Includes different interaction modes and special outputs.",
             "ghoh", "device")
         {
         }
@@ -35,6 +35,7 @@ namespace ghoh
             pManager.AddPlaneParameter("Virtual Cursor", "P_Virt", "The plane of the virtual cursor, used for interactions in non-standard modes.", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Button 1 Status", "B1", "Output Button 1 Status", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Button 2 Status", "B2", "Output Button 2 Status", GH_ParamAccess.item);
+            pManager.AddPointParameter("DogPosition", "DogPos", "The current 3D position of the 'dog' if the DogOnLeash mode is active.", GH_ParamAccess.item);
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
@@ -86,22 +87,25 @@ namespace ghoh
             Plane virtualPlane;
             if (mode == 1)
             {
-                // In Lazy String mode, get the virtual position from the Force Manager
                 var virtualPosNative = ForceManager.TooltipPosition_Native;
-
-                // We need the orientation from the REAL device to construct a plane for the virtual point
                 var tempTransform = (double[])state.Transform.Clone();
                 tempTransform[12] = virtualPosNative.X;
                 tempTransform[13] = virtualPosNative.Y;
                 tempTransform[14] = virtualPosNative.Z;
-
-                // Note: TCP offset is not applied to the virtual cursor, as it's part of the real device setup
                 virtualPlane = CalculatePlaneFromTransform(tempTransform, Vector3d.Zero, additionalTransform);
             }
             else
             {
-                // In standard mode, the virtual cursor is the same as the real one.
                 virtualPlane = realPlane;
+            }
+
+            // --- Get Dog Position ---
+            Point3d dogPos_world = Point3d.Unset;
+            Point3d dogPos_device = ForceManager.DogWorldPosition_RhinoCoords;
+            if (dogPos_device.IsValid)
+            {
+                dogPos_world = dogPos_device;
+                dogPos_world.Transform(additionalTransform);
             }
 
             // Get button status
@@ -113,48 +117,28 @@ namespace ghoh
             DA.SetData(1, virtualPlane);
             DA.SetData(2, button1Status);
             DA.SetData(3, button2Status);
+            DA.SetData(4, dogPos_world);
 
             // IMPORTANT: Return the array from GetCurrentState to the pool
             state.ReturnArrays();
         }
 
-        /// <summary>
-        /// Helper function to create a Rhino Plane from a haptic device transform matrix.
-        /// </summary>
         private Plane CalculatePlaneFromTransform(double[] transform, Vector3d tcpOffset, Transform additionalTransform)
         {
-            var origin = new Point3d(
-                -transform[12],
-                transform[14],
-                transform[13]
-            );
-
-            var xDirection = new Vector3d(
-                -transform[0],
-                transform[2],
-                transform[1]
-            );
-
-            var yDirection = new Vector3d(
-                -transform[4],
-                transform[6],
-                transform[5]
-            );
-
+            var origin = new Point3d(-transform[12], transform[14], transform[13]);
+            var xDirection = new Vector3d(-transform[0], transform[2], transform[1]);
+            var yDirection = new Vector3d(-transform[4], transform[6], transform[5]);
             var plane = new Plane(origin, xDirection, yDirection);
 
-            // Apply TCP offset if provided
             if (!tcpOffset.IsZero)
             {
-                Vector3d zDirection = plane.ZAxis; // Use the calculated Z-axis
                 Vector3d offsetInWorldSpace =
                     tcpOffset.X * plane.XAxis +
                     tcpOffset.Y * plane.YAxis +
-                    tcpOffset.Z * zDirection;
+                    tcpOffset.Z * plane.ZAxis;
                 plane.Origin += offsetInWorldSpace;
             }
 
-            // Apply additional transform if provided
             if (!additionalTransform.Equals(Transform.Identity))
             {
                 plane.Transform(additionalTransform);
@@ -165,6 +149,6 @@ namespace ghoh
 
         protected override System.Drawing.Bitmap Icon => null;
 
-        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c69b");
+        public override Guid ComponentGuid => new Guid("e4826449-a6e0-4edf-b7d2-0e001822c69b"); // Keep GUID for replacement
     }
 }
