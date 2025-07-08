@@ -123,6 +123,23 @@ namespace ghoh
 
         #endregion Existing Force Properties
 
+        #region NEW: Camera-Relative Vibration Parameters
+        public static bool vibrationCurveCameraEnabled = false;
+        public static Curve vibrationCurveCamera_RhinoCoords = null;
+        private static DeviceManager.Vector3D vibrationCurveCameraDirection_RhinoCoords = new DeviceManager.Vector3D(0, 0, 1);
+        private static double vibrationCurveCameraDeadzone = 0.0;
+        private static double vibrationCurveCameraMaxDistance = 10.0;
+        private static double vibrationCurveCameraMaxAmplitude = 1.0;
+        private static double vibrationCurveCameraFrequencyFront = 100.0;
+        private static double vibrationCurveCameraFrequencyBack = 50.0;
+        private static bool vibrationCurveCameraInvertMapping = false;
+        public static double vibrationCurveCameraDistance = 0.0;
+        public static double vibrationCurveCameraAmplitude = 0.0;
+        public static bool vibrationCurveCameraIsFront = false;
+        private static Stopwatch curveCameraCalcStopwatch = new Stopwatch();
+        public static double vibrationCurveCameraCalcTime = 0.0;
+        #endregion
+
         // --- "Lazy String" / Pulled String parameters ---
         private static bool lazyStringEnabled = false;
         private static double stringLength = 20.0;
@@ -795,6 +812,124 @@ namespace ghoh
 
         #endregion Existing Force Calculation Methods
 
+        #region NEW: Camera-Relative Vibration Methods
+        public static void SetVibrateCurveCamera(
+            Curve curve_Rhino, DeviceManager.Vector3D direction_Rhino, bool enable,
+            double deadzone, double maxDistance, double maxAmplitude,
+            double frequencyFront, double frequencyBack, bool invertMapping)
+        {
+            bool previousState = vibrationCurveCameraEnabled;
+            vibrationCurveCameraEnabled = enable;
+            if (enable)
+            {
+                vibrationCurveCamera_RhinoCoords = curve_Rhino;
+                vibrationCurveCameraDirection_RhinoCoords = direction_Rhino;
+                vibrationCurveCameraDeadzone = deadzone;
+                vibrationCurveCameraMaxDistance = maxDistance;
+                vibrationCurveCameraMaxAmplitude = maxAmplitude;
+                vibrationCurveCameraFrequencyFront = frequencyFront;
+                vibrationCurveCameraFrequencyBack = frequencyBack;
+                vibrationCurveCameraInvertMapping = invertMapping;
+                if (!previousState) Vibration.Reset();
+            }
+            else
+            {
+                vibrationCurveCamera_RhinoCoords = null;
+            }
+        }
+
+        private static double[] CalculateVibrationCurveCameraForce_Native(DeviceManager.Vector3D devicePos_Rhino)
+        {
+            if (!vibrationCurveCameraEnabled || vibrationCurveCamera_RhinoCoords == null)
+            {
+                vibrationCurveCameraAmplitude = 0; vibrationCurveCameraDistance = -1; vibrationCurveCameraCalcTime = 0; return new double[] { 0, 0, 0 };
+            }
+
+            curveCameraCalcStopwatch.Restart();
+
+            // Get active viewport to access camera information
+            var view = Rhino.RhinoDoc.ActiveDoc?.Views?.ActiveView;
+            if (view == null)
+            {
+                curveCameraCalcStopwatch.Stop();
+                return new double[] { 0, 0, 0 };
+            }
+            var vp = view.ActiveViewport;
+            Point3d cameraPos_Rhino = vp.CameraLocation;
+            Vector3d cameraDir_Rhino = vp.CameraDirection;
+            cameraDir_Rhino.Unitize();
+
+            Point3d rhinoDevicePt = new Point3d(devicePos_Rhino.X, devicePos_Rhino.Y, devicePos_Rhino.Z);
+            double curveParam;
+
+            if (!vibrationCurveCamera_RhinoCoords.IsValid || vibrationCurveCamera_RhinoCoords.Domain.IsSingleton)
+            {
+                vibrationCurveCameraAmplitude = 0; vibrationCurveCameraDistance = -1;
+                curveCameraCalcStopwatch.Stop();
+                vibrationCurveCameraCalcTime = curveCameraCalcStopwatch.Elapsed.TotalMilliseconds;
+                return new double[] { 0, 0, 0 };
+            }
+
+            vibrationCurveCamera_RhinoCoords.ClosestPoint(rhinoDevicePt, out curveParam);
+            Point3d closestPt_Rhino = vibrationCurveCamera_RhinoCoords.PointAt(curveParam);
+            vibrationCurveCameraDistance = rhinoDevicePt.DistanceTo(closestPt_Rhino);
+
+            // Determine if device is in front or behind the curve from the camera's perspective
+            Vector3d vecCamToCurve = closestPt_Rhino - cameraPos_Rhino;
+            Vector3d vecCamToDevice = rhinoDevicePt - cameraPos_Rhino;
+
+            double distCurveAlongCamDir = vecCamToCurve * cameraDir_Rhino; // Dot product
+            double distDeviceAlongCamDir = vecCamToDevice * cameraDir_Rhino;
+
+            vibrationCurveCameraIsFront = distDeviceAlongCamDir < distCurveAlongCamDir;
+            double selectedFrequency = vibrationCurveCameraIsFront ? vibrationCurveCameraFrequencyFront : vibrationCurveCameraFrequencyBack;
+
+            // --- Amplitude Calculation (copied from original vibrate curve) ---
+            double ampFactor = 0.0;
+            double usableRange = vibrationCurveCameraMaxDistance - vibrationCurveCameraDeadzone;
+            if (usableRange < 0.001) usableRange = 0.001;
+
+            if (vibrationCurveCameraInvertMapping)
+            {
+                if (vibrationCurveCameraDistance >= vibrationCurveCameraMaxDistance) ampFactor = 0.0;
+                else if (vibrationCurveCameraDistance < vibrationCurveCameraDeadzone) ampFactor = 1.0;
+                else ampFactor = 1.0 - ((vibrationCurveCameraDistance - vibrationCurveCameraDeadzone) / usableRange);
+            }
+            else
+            {
+                if (vibrationCurveCameraDistance >= vibrationCurveCameraMaxDistance) ampFactor = 1.0;
+                else if (vibrationCurveCameraDistance < vibrationCurveCameraDeadzone) ampFactor = 0.0;
+                else ampFactor = (vibrationCurveCameraDistance - vibrationCurveCameraDeadzone) / usableRange;
+            }
+            ampFactor = Math.Max(0.0, Math.Min(1.0, ampFactor));
+            vibrationCurveCameraAmplitude = vibrationCurveCameraMaxAmplitude * ampFactor;
+
+            if (vibrationCurveCameraAmplitude < 0.0001)
+            {
+                curveCameraCalcStopwatch.Stop();
+                vibrationCurveCameraCalcTime = curveCameraCalcStopwatch.Elapsed.TotalMilliseconds;
+                return new double[] { 0, 0, 0 };
+            }
+
+            // --- Vibration Calculation ---
+            double osc = Vibration.GetVibrationMultiplier(Vibration.VibrationMode.Sine, selectedFrequency, 0, 0);
+            double vibMag = vibrationCurveCameraAmplitude * osc;
+
+            Vector3d forceVec_Rhino = new Vector3d(
+                vibrationCurveCameraDirection_RhinoCoords.X,
+                vibrationCurveCameraDirection_RhinoCoords.Y,
+                vibrationCurveCameraDirection_RhinoCoords.Z
+            );
+            forceVec_Rhino.Unitize();
+            forceVec_Rhino *= vibMag;
+
+            curveCameraCalcStopwatch.Stop();
+            vibrationCurveCameraCalcTime = curveCameraCalcStopwatch.Elapsed.TotalMilliseconds;
+
+            return new double[] { -forceVec_Rhino.X, forceVec_Rhino.Z, forceVec_Rhino.Y };
+        }
+        #endregion
+
         // --- UPDATED: Dog on a Leash Force Calculation ---
         private static double[] CalculateDogOnLeashForce_Native(DeviceManager.Vector3D devicePos_Rhino, bool button1Pressed)
         {
@@ -978,6 +1113,7 @@ namespace ghoh
             if (dogOnLeashEnabled) { var f = CalculateDogOnLeashForce_Native(currentTCP_RhinoCoords, button1Pressed); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (viscousDampingEnabled) { var f = CalculateViscousForce_Native(); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (vibrationCurveEnabled) { var f = CalculateVibrationCurveForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
+            if (vibrationCurveCameraEnabled) { var f = CalculateVibrationCurveCameraForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; } // NEW
             if (vibrationPointSystemEnabled) { var f = CalculateVibrationPointForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (planeCollisionEnabled) { var f = CalculatePlaneCollisionForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
             if (multiPullToPointEnabled) { if (smoothingEnabledMultiPoint) UpdateSmoothedTargets(); var f = CalculateMultiPullToPointForce_Native(currentTCP_RhinoCoords); for (int i = 0; i < 3; i++) totalForceForFrame_NativeDeviceCoords[i] += f[i]; }
@@ -1064,6 +1200,7 @@ namespace ghoh
             viscousDampingEnabled = false; Array.Clear(lastViscousForce_Native, 0, 3); Array.Clear(lastVelocity_Native, 0, 3); Array.Clear(filteredVelocity_Native, 0, 3); if (viscousForceFilter != null) viscousForceFilter.Reset();
             planeCollisionEnabled = false;
             vibrationCurveEnabled = false; vibrationCurve_RhinoCoords = null;
+            vibrationCurveCameraEnabled = false; vibrationCurveCamera_RhinoCoords = null; // NEW
             vibrationPointSystemEnabled = false; vibrationPointTargets_RhinoCoords.Clear();
             pullToCurveEnabled = false; pullToCurve_RhinoCoords = null; ResetTravelingPointInternal();
             tcpOffset = new DeviceManager.Vector3D(0, 0, 0);
